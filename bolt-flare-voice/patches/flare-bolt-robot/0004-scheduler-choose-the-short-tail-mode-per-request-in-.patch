@@ -1,0 +1,328 @@
+From 56991db55a64a87ecc7731c5c3434550e47ff1fb Mon Sep 17 00:00:00 2001
+From: Hyperdrive Project <noreply@hyperdrive-project.invalid>
+Date: Sun, 25 Oct 2026 14:50:45 +0000
+Subject: [PATCH 4/6] scheduler: choose the short-tail mode per request in the
+ policy (keeps the system-prompt checkpoint)
+
+Admission-time boundary dropping removed message checkpoints such as the system prompt when a user
+turn was short. RequestSpec/LiveRequest now carry stable_history and prefill_work applies keep-last
+only to unstable (reasoning) prompts. 952 Helios lib tests pass.
+
+---
+ helios/src/model/packed_round_tests.rs   |  2 +-
+ helios/src/model/tests.rs                | 16 ++++++++--------
+ helios/src/scheduler.rs                  |  4 ++++
+ helios/src/scheduler/boundary_tests.rs   |  2 +-
+ helios/src/scheduler/policy.rs           |  2 +-
+ helios/src/scheduler/policy_tests.rs     |  6 +++---
+ helios/src/scheduler/tests.rs            | 10 +++++-----
+ helios/src/server/runtime.rs             | 15 +++++----------
+ helios/src/server/runtime/phase_tests.rs |  6 +++---
+ 9 files changed, 31 insertions(+), 32 deletions(-)
+
+diff --git a/helios/src/model/packed_round_tests.rs b/helios/src/model/packed_round_tests.rs
+index a904ccd1..98658808 100644
+--- a/helios/src/model/packed_round_tests.rs
++++ b/helios/src/model/packed_round_tests.rs
+@@ -111,7 +111,7 @@ fn packed_combined_packing_preserves_sparse_slot_keys_and_ceiling_padding() {
+     let mut handles = Vec::new();
+     for _ in 0..4 {
+         let prompt = vec![7; 64];
+-        let h = scheduler.admit(RequestSpec { prompt_logprobs: false, message_boundaries: vec![], prompt: prompt.clone(), conditioning: vec![],
++        let h = scheduler.admit(RequestSpec { stable_history: false, prompt_logprobs: false, message_boundaries: vec![], prompt: prompt.clone(), conditioning: vec![],
+             max_new_tokens: 64, grammar_constrained: false, host_stops: false, growable_output: false }).unwrap();
+         admissions[h.slot as usize] = Some(Admission { prompt_logprobs: false, handle: h, sampling: SamplingParameters::default(),
+             max_new_tokens: 64, prompt, data: PromptData { positions: (0..64).map(|i| [i; 3]).collect(),
+diff --git a/helios/src/model/tests.rs b/helios/src/model/tests.rs
+index ffb0433e..033c4393 100644
+--- a/helios/src/model/tests.rs
++++ b/helios/src/model/tests.rs
+@@ -62,7 +62,7 @@ fn admission_histogram_seed_and_partial_page_uploads_preserve_native_semantics()
+         .measured_graph_durations(&self::manifest(&config).graphs)
+         .unwrap();
+     let handle = scheduler
+-        .admit(RequestSpec {
++        .admit(RequestSpec { stable_history: false,
+             message_boundaries: vec![],
+             prompt: vec![7; 65],
+             conditioning: vec![],
+@@ -209,7 +209,7 @@ fn large_prefill_uploads_preserve_token_position_and_image_indices_without_tail_
+         .unwrap();
+     let prompt: Vec<u32> = (0..4113).collect();
+     let handle = scheduler
+-        .admit(RequestSpec {
++        .admit(RequestSpec { stable_history: false,
+             message_boundaries: vec![],
+             prompt: prompt.clone(),
+             conditioning: vec![],
+@@ -515,7 +515,7 @@ fn packing_follows_value_bindings_after_buffers_and_model_are_renamed() {
+         .measured_graph_durations(&manifest.graphs)
+         .unwrap();
+     let handle = scheduler
+-        .admit(RequestSpec {
++        .admit(RequestSpec { stable_history: false,
+             message_boundaries: vec![],
+             prompt: vec![7; 65],
+             conditioning: vec![],
+@@ -652,7 +652,7 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
+     let handles = (0..3)
+         .map(|slot| {
+             scheduler
+-                .admit(RequestSpec {
++                .admit(RequestSpec { stable_history: false,
+                     message_boundaries: vec![],
+                     prompt: vec![7; 65],
+                     conditioning: vec![],
+@@ -877,7 +877,7 @@ fn mixed_native_uploads_pack_prompt_after_the_decode_extent_and_sample_only_elig
+         let mut admit = |scheduler: &mut RequestScheduler, count: usize, token: u32| {
+             let prompt = vec![token; count];
+             let h = scheduler
+-                .admit(RequestSpec {
++                .admit(RequestSpec { stable_history: false,
+                     prompt: prompt.clone(),
+                     message_boundaries: vec![],
+                     conditioning: vec![],
+@@ -1084,7 +1084,7 @@ fn state_transfer_and_resume_upload_fixture() {
+     for cycle in 0..2 {
+         let prompt = vec![7; 64];
+         let handle = scheduler
+-            .admit(RequestSpec {
++            .admit(RequestSpec { stable_history: false,
+                 message_boundaries: vec![],
+                 prompt: prompt.clone(),
+                 conditioning: vec![],
+@@ -1460,7 +1460,7 @@ fn grammar_packing_fixture() -> (
+     let mut lanes = Vec::new();
+     for _ in 0..8 {
+         let handle = scheduler
+-            .admit(RequestSpec {
++            .admit(RequestSpec { stable_history: false,
+                 message_boundaries: vec![],
+                 prompt: vec![7; 66],
+                 conditioning: vec![],
+@@ -1683,7 +1683,7 @@ fn prefill_compacts_execution_feature_indices_and_preserves_admission_metadata()
+         .measured_graph_durations(&manifest(&config).graphs)
+         .unwrap();
+     let handle = scheduler
+-        .admit(RequestSpec {
++        .admit(RequestSpec { stable_history: false,
+             prompt: vec![7; 4],
+             message_boundaries: vec![],
+             conditioning: vec![],
+diff --git a/helios/src/scheduler.rs b/helios/src/scheduler.rs
+index 486b33b6..bb455626 100644
+--- a/helios/src/scheduler.rs
++++ b/helios/src/scheduler.rs
+@@ -129,6 +129,8 @@ pub struct SchedulerStats {
+ pub struct RequestSpec {
+     pub prompt: Vec<u32>,
+     pub message_boundaries: Vec<usize>,
++    /// Fork: earlier turns re-render unchanged (thinking disabled); see `--prefill-short-tail`.
++    pub stable_history: bool,
+     pub conditioning: Vec<ConditioningEvent>,
+     pub max_new_tokens: u32,
+     pub grammar_constrained: bool,
+@@ -213,6 +215,7 @@ pub struct LiveRequest {
+     prefix_tokens: u64,
+     admission_reused_tokens: u64,
+     message_boundaries: Vec<usize>,
++    stable_history: bool,
+     message_snapshot: Option<SnapshotId>,
+     prompt_snapshot: Option<SnapshotId>,
+     boundary_capture: Option<BoundaryCapture>,
+@@ -1517,6 +1520,7 @@ impl RequestScheduler {
+             prefix_tokens: consumed,
+             admission_reused_tokens: consumed,
+             message_boundaries: spec.message_boundaries,
++            stable_history: spec.stable_history,
+             message_snapshot: None,
+             prompt_snapshot: None,
+             boundary_capture: None,
+diff --git a/helios/src/scheduler/boundary_tests.rs b/helios/src/scheduler/boundary_tests.rs
+index a90501b8..5a8193ea 100644
+--- a/helios/src/scheduler/boundary_tests.rs
++++ b/helios/src/scheduler/boundary_tests.rs
+@@ -39,7 +39,7 @@ fn scheduler_with_pages(snapshots: u32, mtp: bool, page_tokens: usize) -> Reques
+     s
+ }
+ fn spec(system: Option<usize>, prompt: usize, output: u32) -> RequestSpec {
+-    RequestSpec {
++    RequestSpec { stable_history: false,
+         message_boundaries: system.into_iter().collect(),
+         prompt: (0..prompt as u32).collect(),
+         conditioning: vec![],
+diff --git a/helios/src/scheduler/policy.rs b/helios/src/scheduler/policy.rs
+index b9308df6..299ccef8 100644
+--- a/helios/src/scheduler/policy.rs
++++ b/helios/src/scheduler/policy.rs
+@@ -302,7 +302,7 @@ impl RequestScheduler {
+             let last = request.message_boundaries.iter().rev()
+                 .find(|&&n| start < n && n < start + tail).copied();
+             match last {
+-                Some(n) if self.policy.prefill_short_tail_keep_last => n,
++                Some(n) if self.policy.prefill_short_tail_keep_last && !request.stable_history => n,
+                 _ => start + tail,
+             }
+         } else {
+diff --git a/helios/src/scheduler/policy_tests.rs b/helios/src/scheduler/policy_tests.rs
+index 1ef13ba4..174202a9 100644
+--- a/helios/src/scheduler/policy_tests.rs
++++ b/helios/src/scheduler/policy_tests.rs
+@@ -92,7 +92,7 @@ fn engine(active: usize, speculative: bool) -> RequestScheduler {
+ }
+ 
+ fn add(s: &mut RequestScheduler, id: u32, prompt: usize, output: u32) -> RequestHandle {
+-    s.admit(RequestSpec {
++    s.admit(RequestSpec { stable_history: false,
+         prompt: vec![id; prompt],
+         message_boundaries: vec![],
+         conditioning: vec![],
+@@ -1609,7 +1609,7 @@ fn prerequisite_cohort_accounts_for_ready_batch_mates() {
+     }
+     let decode = add(&mut s, 15, 64, 4096);
+     let prefill = s
+-        .admit(RequestSpec {
++        .admit(RequestSpec { stable_history: false,
+             prompt: vec![16; 32768],
+             message_boundaries: vec![512],
+             conditioning: vec![],
+@@ -2160,7 +2160,7 @@ fn mixed_cancellation_keeps_other_rows_live_and_retires_pages_only_after_complet
+     s.cancel(p).unwrap();
+     assert_eq!(s.free_pages.len(), free);
+     assert!(
+-        s.admit(RequestSpec {
++        s.admit(RequestSpec { stable_history: false,
+             prompt: vec![3; 64],
+             message_boundaries: vec![],
+             conditioning: vec![],
+diff --git a/helios/src/scheduler/tests.rs b/helios/src/scheduler/tests.rs
+index f037c126..cdd40de4 100644
+--- a/helios/src/scheduler/tests.rs
++++ b/helios/src/scheduler/tests.rs
+@@ -198,7 +198,7 @@ pub(crate) fn duration_graphs(active: usize) -> Vec<crate::execution::GraphDescr
+ }
+ 
+ pub(super) fn spec(tokens: usize, max_new: u32) -> RequestSpec {
+-    RequestSpec {
++    RequestSpec { stable_history: false,
+         message_boundaries: vec![],
+         prompt: (0..tokens as u32).collect(),
+         conditioning: vec![],
+@@ -1993,7 +1993,7 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
+     s.measured_graph_durations(&duration_graphs(1)).unwrap();
+     s.enable_speculation(&[1, 2]).unwrap();
+     let handle = s
+-        .admit(RequestSpec {
++        .admit(RequestSpec { stable_history: false,
+             message_boundaries: vec![],
+             prompt: vec![7; 4],
+             conditioning: vec![],
+@@ -2888,7 +2888,7 @@ fn pinned_checkpoints_survive_eviction_pressure_until_unpinned() {
+ fn take_publications_reports_boundary_and_terminal_checkpoints_once() {
+     let mut scheduler = host_scheduler(1, 8, 4);
+     let handle = scheduler
+-        .admit(RequestSpec {
++        .admit(RequestSpec { stable_history: false,
+             message_boundaries: vec![64],
+             ..spec(130, 2)
+         })
+@@ -3062,7 +3062,7 @@ fn sample_round(scheduler: &mut RequestScheduler, fence: u64) -> ScheduledStep {
+ }
+ 
+ fn growable(tokens: usize, max_new: u32) -> RequestSpec {
+-    RequestSpec {
++    RequestSpec { stable_history: false,
+         growable_output: true,
+         ..spec(tokens, max_new)
+     }
+@@ -3111,7 +3111,7 @@ fn starved_growable_request_preempts_the_newest_and_resumes_from_its_checkpoint(
+     scheduler.cancel(older).unwrap();
+     // Readmitting the history restores the published checkpoint instead of recomputing it.
+     let resumed = scheduler
+-        .admit(RequestSpec {
++        .admit(RequestSpec { stable_history: false,
+             prompt: tokens,
+             growable_output: true,
+             ..spec(1, remaining)
+diff --git a/helios/src/server/runtime.rs b/helios/src/server/runtime.rs
+index a42ff272..f3108d20 100644
+--- a/helios/src/server/runtime.rs
++++ b/helios/src/server/runtime.rs
+@@ -1127,14 +1127,9 @@ impl<'a> Worker<'a> {
+                 incoming.reject_admission("logprobs are not available in this model package".into());
+                 continue;
+             }
+-            let short_tail = self.scheduler.prefill_short_tail_tokens();
+-            let mut message_boundaries = incoming.prompt.message_boundaries.clone();
+-            if short_tail > 0 && incoming.prompt.stable_history {
+-                let tail_start = incoming.prompt.tokens.len().saturating_sub(short_tail);
+-                message_boundaries.retain(|&n| n <= tail_start);
+-            }
+             let spec = RequestSpec {
+-                message_boundaries,
++                stable_history: incoming.prompt.stable_history,
++                message_boundaries: incoming.prompt.message_boundaries.clone(),
+                 prompt: incoming.prompt.tokens.clone(),
+                 conditioning: incoming.prompt.conditioning.clone(),
+                 max_new_tokens: incoming.prompt.max_new_tokens,
+@@ -2480,7 +2475,7 @@ mod tests {
+         scheduler
+             .measured_graph_durations(&crate::scheduler::tests::duration_graphs(4))
+             .unwrap();
+-        let spec = |token, grammar_constrained| RequestSpec {
++        let spec = |token, grammar_constrained| RequestSpec { stable_history: false,
+             message_boundaries: vec![],
+             prompt: vec![token],
+             conditioning: vec![],
+@@ -2720,7 +2715,7 @@ mod tests {
+     }
+ 
+     fn retirement_spec(grammar_constrained: bool) -> RequestSpec {
+-        RequestSpec {
++        RequestSpec { stable_history: false,
+             message_boundaries: vec![],
+             prompt: vec![0],
+             conditioning: vec![],
+@@ -3232,7 +3227,7 @@ mod tests {
+             },
+         )
+         .unwrap();
+-        let spec = || RequestSpec {
++        let spec = || RequestSpec { stable_history: false,
+             message_boundaries: vec![],
+             prompt: vec![7],
+             conditioning: vec![],
+diff --git a/helios/src/server/runtime/phase_tests.rs b/helios/src/server/runtime/phase_tests.rs
+index a84f302a..352b6ba5 100644
+--- a/helios/src/server/runtime/phase_tests.rs
++++ b/helios/src/server/runtime/phase_tests.rs
+@@ -1739,7 +1739,7 @@ fn exercise_text_preemption(
+     if evict_checkpoint {
+         let pressure = worker
+             .scheduler
+-            .admit(RequestSpec {
++            .admit(RequestSpec { stable_history: false,
+                 prompt: vec![3; page_tokens * 5],
+                 max_new_tokens: 1,
+                 growable_output: false,
+@@ -2464,7 +2464,7 @@ fn host_prefix_selects_whole_required_images_and_compacts_feature_indices() {
+         if expected == 0 {
+             let occupied = worker
+                 .scheduler
+-                .admit(RequestSpec {
++                .admit(RequestSpec { stable_history: false,
+                     prompt: vec![1; 2],
+                     message_boundaries: vec![],
+                     conditioning: vec![],
+@@ -2924,7 +2924,7 @@ fn publication_retries_wait_for_progress_and_pin_only_admitted_copies() {
+         .store_outcomes
+         .push_back(StoreOutcome::Retry(StoreReason::Slabs));
+     worker.attach_store(Some(Box::new(store)));
+-    let spec = RequestSpec {
++    let spec = RequestSpec { stable_history: false,
+         prompt: vec![0; 70],
+         message_boundaries: vec![],
+         conditioning: vec![],
+-- 
+2.43.0
+

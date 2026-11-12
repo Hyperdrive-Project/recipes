@@ -1,0 +1,285 @@
+# Nemotron Hyperdrive trt-loop (2026-11-02): Triton varlen channel-last causal conv1d for Mamba2 prefill, NHD_CONV_TRITON=1.
+diff -ruN -x __pycache__ a/tensorrt_llm/_torch/modules/mamba/causal_conv1d.py b/tensorrt_llm/_torch/modules/mamba/causal_conv1d.py
+--- a/tensorrt_llm/_torch/modules/mamba/causal_conv1d.py	2026-11-02 09:52:06.010163414 +0000
++++ b/tensorrt_llm/_torch/modules/mamba/causal_conv1d.py	2026-11-02 10:08:36.055896328 +0000
+@@ -16,12 +16,30 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import os
+ from typing import Optional
+ 
+ import torch
+ 
+ from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+ 
++# Nemotron Hyperdrive: NHD_CONV_TRITON=1 sends the packed varlen channel-last prefill call (Mamba2Mixer's token-major
++# path) to the Triton kernel in nhd_conv1d.py (same contract as causal_conv1d_fwd, whose channel-last kernel reaches
++# only ~2.2 TB/s on B300).
++_NHD_CONV_TRITON = os.environ.get("NHD_CONV_TRITON", "0") == "1"
++if _NHD_CONV_TRITON:
++    from .nhd_conv1d import causal_conv1d_varlen_channel_last
++
++    # NHD_CONV_TILE = split x block_t x block_c x num_warps, or @FILE holding that string (written by the microbench).
++    _tile = os.environ.get("NHD_CONV_TILE", "1x32x128x4")
++    if _tile.startswith("@"):
++        try:
++            _tile = open(_tile[1:]).read().strip()
++        except OSError:
++            _tile = "1x32x128x4"
++    _s, _bt, _bc, _nw = (int(v) for v in _tile.split("x"))
++    _NHD_CONV_CFG = dict(split=bool(_s), block_t=_bt, block_c=_bc, num_warps=_nw)
++
+ 
+ def causal_conv1d_fn(x: torch.Tensor,
+                      weight: torch.Tensor,
+@@ -92,6 +110,13 @@
+                               dtype=x.dtype,
+                               device=x.device).transpose(1, 2)
+ 
++    if (_NHD_CONV_TRITON and channel_last and x.dim() == 2
++            and query_start_loc is not None):
++        return causal_conv1d_varlen_channel_last(
++            x, weight, bias, conv_states, query_start_loc, cache_indices,
++            has_initial_state, activation in ["silu", "swish"], pad_slot_id,
++            out, **_NHD_CONV_CFG)
++
+     torch.ops.trtllm.causal_conv1d_fwd(x, weight, bias, conv_states,
+                                        query_start_loc, cache_indices,
+                                        has_initial_state, activation
+diff -ruN -x __pycache__ a/tensorrt_llm/_torch/modules/mamba/nhd_conv1d.py b/tensorrt_llm/_torch/modules/mamba/nhd_conv1d.py
+--- a/tensorrt_llm/_torch/modules/mamba/nhd_conv1d.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tensorrt_llm/_torch/modules/mamba/nhd_conv1d.py	2026-11-02 10:51:14.551778596 +0000
+@@ -0,0 +1,232 @@
++# Nemotron Hyperdrive (trt-loop, 2026-11-02): Triton causal conv1d forward for the token-major (channel-last) packed
++# varlen prefill call of Mamba2Mixer (x = [tokens, channels] view of the in_proj output, out = token-major buffer),
++# with per-sequence initial conv states and the in-place conv-state update, i.e. the same contract as
++# torch.ops.trtllm.causal_conv1d_fwd on that path. The CUDA kernel it replaces ran at ~25% of HBM bandwidth on B300
++# (j14b profile: 669 us per layer for 32K tokens x 10240 channels). Enabled by NHD_CONV_TRITON=1 (causal_conv1d.py).
++#
++# out[c, s+t] = act(bias[c] + sum_k w[c, k] * xx[t + k]),  xx = init window (W-1 values from conv_states, or zeros)
++# followed by the sequence's x; afterwards conv_states[slot] = last W-1 values of xx. Sequences whose cache index is
++# pad_slot_id are skipped (their output rows are left untouched).
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _conv_fwd_kernel(x_ptr, w_ptr, b_ptr, st_ptr, qsl_ptr, ci_ptr, init_ptr, out_ptr,
++                     T, C, NSEQ, sx_t, sx_c, so_t, so_c, sw_c, sw_k, ss_n, ss_c, ss_k, pad_slot_id,
++                     W: tl.constexpr, HAS_BIAS: tl.constexpr, HAS_INIT: tl.constexpr, HAS_CI: tl.constexpr,
++                     SILU: tl.constexpr, LOG2_NSEQ: tl.constexpr, EVEN_C: tl.constexpr, BOUNDARY_GRID: tl.constexpr,
++                     BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
++    pid_t = tl.program_id(0)
++    pid_c = tl.program_id(1)
++    if BOUNDARY_GRID:
++        # Grid of 2 programs per sequence boundary qsl[b], b = 0..NSEQ: the tile holding qsl[b], and the next tile when
++        # its W-1 halo rows reach back across qsl[b]. These are the only tiles _conv_fwd_fast_kernel leaves undone
++        # (a tile it repeats here is written twice with the same values).
++        sb = tl.load(qsl_ptr + pid_t // 2)
++        ta = sb // BLOCK_T
++        t0 = tl.where((pid_t % 2 == 1) & ((ta + 1) * BLOCK_T <= sb + (W - 2)), ta + 1, ta) * BLOCK_T
++    else:
++        t0 = pid_t * BLOCK_T
++    rows = tl.arange(0, BLOCK_T)
++    t = t0 + rows
++    c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
++    cmask = c < C
++    if HAS_BIAS:
++        bias = tl.load(b_ptr + c, mask=cmask, other=0.0).to(tl.float32)
++    else:
++        bias = tl.zeros([BLOCK_C], dtype=tl.float32)
++    # Sequence of the tile's first token: largest b with qsl[b] <= t0 (scalar binary search over NSEQ+1 boundaries).
++    lo = NSEQ * 0
++    hi = NSEQ + 0
++    for _ in tl.static_range(LOG2_NSEQ + 1):
++        mid = (lo + hi + 1) // 2
++        go = tl.load(qsl_ptr + mid) <= t0
++        lo = tl.where(go, mid, lo)
++        hi = tl.where(go, hi, mid - 1)
++    seq0 = tl.minimum(lo, NSEQ - 1)
++    # Fast path (nearly every tile of a long prefill): the tile and its W-1 halo rows sit inside one live sequence, so
++    # the taps are plain shifted loads (no initial state, no per-token sequence lookup, no token masks).
++    fast = (t0 - (W - 1) >= tl.load(qsl_ptr + seq0)) & (t0 + BLOCK_T <= tl.load(qsl_ptr + seq0 + 1))
++    if HAS_CI:
++        fast = fast & (tl.load(ci_ptr + seq0) != pad_slot_id)
++    # Names assigned in both branches of this runtime `if` (acc, wk, xv) must have the same type in each (Triton
++    # rule; the interpreter does not check it), so the loads are cast to fp32 in both.
++    if fast:
++        offs = t[:, None] * sx_t + c[None, :] * sx_c
++        acc = bias[None, :] + tl.zeros([BLOCK_T, BLOCK_C], tl.float32)
++        for k in tl.static_range(W):
++            wk = tl.load(w_ptr + c * sw_c + k * sw_k, mask=cmask, other=0.0).to(tl.float32)
++            if EVEN_C:
++                xv = tl.load(x_ptr + offs + (k - (W - 1)) * sx_t).to(tl.float32)
++            else:
++                xv = tl.load(x_ptr + offs + (k - (W - 1)) * sx_t, mask=cmask[None, :], other=0.0).to(tl.float32)
++            acc += xv * wk[None, :]
++        if SILU:
++            acc = acc / (1.0 + tl.exp(-acc))
++        o_offs = t[:, None] * so_t + c[None, :] * so_c
++        if EVEN_C:
++            tl.store(out_ptr + o_offs, acc.to(out_ptr.dtype.element_ty))
++        else:
++            tl.store(out_ptr + o_offs, acc.to(out_ptr.dtype.element_ty), mask=cmask[None, :])
++    else:
++        tmask = t < T
++        # per-token sequence: largest b with qsl[b] <= t
++        lo2 = tl.zeros([BLOCK_T], dtype=tl.int32)
++        hi2 = tl.zeros([BLOCK_T], dtype=tl.int32) + NSEQ
++        for _ in tl.static_range(LOG2_NSEQ + 1):
++            mid2 = (lo2 + hi2 + 1) // 2
++            go2 = tl.load(qsl_ptr + mid2, mask=tmask, other=0) <= t
++            lo2 = tl.where(go2, mid2, lo2)
++            hi2 = tl.where(go2, hi2, mid2 - 1)
++        seq = tl.minimum(lo2, NSEQ - 1)
++        pos = t - tl.load(qsl_ptr + seq, mask=tmask, other=0)
++        valid = tmask
++        if HAS_CI:
++            slot = tl.load(ci_ptr + seq, mask=tmask, other=0)
++            valid = valid & (slot != pad_slot_id)
++        else:
++            slot = seq
++        if HAS_INIT:
++            has_init = tl.load(init_ptr + seq, mask=tmask, other=0) != 0
++        m2 = valid[:, None] & cmask[None, :]
++        acc = bias[None, :] + tl.zeros([BLOCK_T, BLOCK_C], tl.float32)
++        for k in tl.static_range(W):
++            p = pos - (W - 1) + k  # position of this tap inside the sequence (negative = initial window)
++            wk = tl.load(w_ptr + c * sw_c + k * sw_k, mask=cmask, other=0.0).to(tl.float32)
++            in_seq = p >= 0
++            xv = tl.load(x_ptr + (t - (W - 1) + k)[:, None] * sx_t + c[None, :] * sx_c,
++                         mask=m2 & in_seq[:, None], other=0.0).to(tl.float32)
++            if HAS_INIT:
++                sm = m2 & ((~in_seq) & has_init)[:, None]
++                xv += tl.load(st_ptr + slot[:, None] * ss_n + c[None, :] * ss_c + ((W - 1) + p)[:, None] * ss_k,
++                              mask=sm, other=0.0).to(tl.float32)
++            acc += xv * wk[None, :]
++        if SILU:
++            acc = acc / (1.0 + tl.exp(-acc))
++        tl.store(out_ptr + t[:, None] * so_t + c[None, :] * so_c, acc.to(out_ptr.dtype.element_ty), mask=m2)
++
++
++@triton.jit
++def _conv_fwd_fast_kernel(x_ptr, w_ptr, b_ptr, qsl_ptr, ci_ptr, out_ptr, C, NSEQ, sx_t, sx_c, so_t, so_c, sw_c, sw_k,
++                          pad_slot_id, W: tl.constexpr, HAS_BIAS: tl.constexpr, HAS_CI: tl.constexpr,
++                          SILU: tl.constexpr, LOG2_NSEQ: tl.constexpr, EVEN_C: tl.constexpr, BLOCK_T: tl.constexpr,
++                          BLOCK_C: tl.constexpr):
++    """Interior tiles only (tile plus halo inside one live sequence); _conv_fwd_kernel with BOUNDARY_GRID does the
++    rest. Separate kernel so the general path's register pressure does not cut this one's occupancy."""
++    pid_t = tl.program_id(0)
++    pid_c = tl.program_id(1)
++    t0 = pid_t * BLOCK_T
++    lo = NSEQ * 0
++    hi = NSEQ + 0
++    for _ in tl.static_range(LOG2_NSEQ + 1):
++        mid = (lo + hi + 1) // 2
++        go = tl.load(qsl_ptr + mid) <= t0
++        lo = tl.where(go, mid, lo)
++        hi = tl.where(go, hi, mid - 1)
++    seq0 = tl.minimum(lo, NSEQ - 1)
++    fast = (t0 - (W - 1) >= tl.load(qsl_ptr + seq0)) & (t0 + BLOCK_T <= tl.load(qsl_ptr + seq0 + 1))
++    if HAS_CI:
++        fast = fast & (tl.load(ci_ptr + seq0) != pad_slot_id)
++    if fast:
++        t = t0 + tl.arange(0, BLOCK_T)
++        c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
++        cmask = c < C
++        if HAS_BIAS:
++            acc = tl.load(b_ptr + c, mask=cmask, other=0.0).to(tl.float32)[None, :] + \
++                tl.zeros([BLOCK_T, BLOCK_C], tl.float32)
++        else:
++            acc = tl.zeros([BLOCK_T, BLOCK_C], tl.float32)
++        offs = t[:, None] * sx_t + c[None, :] * sx_c
++        for k in tl.static_range(W):
++            wk = tl.load(w_ptr + c * sw_c + k * sw_k, mask=cmask, other=0.0).to(tl.float32)
++            if EVEN_C:
++                xv = tl.load(x_ptr + offs + (k - (W - 1)) * sx_t).to(tl.float32)
++            else:
++                xv = tl.load(x_ptr + offs + (k - (W - 1)) * sx_t, mask=cmask[None, :], other=0.0).to(tl.float32)
++            acc += xv * wk[None, :]
++        if SILU:
++            acc = acc / (1.0 + tl.exp(-acc))
++        o_offs = t[:, None] * so_t + c[None, :] * so_c
++        if EVEN_C:
++            tl.store(out_ptr + o_offs, acc.to(out_ptr.dtype.element_ty))
++        else:
++            tl.store(out_ptr + o_offs, acc.to(out_ptr.dtype.element_ty), mask=cmask[None, :])
++
++
++@triton.jit
++def _conv_state_kernel(x_ptr, st_ptr, qsl_ptr, ci_ptr, init_ptr, C, sx_t, sx_c, ss_n, ss_c, ss_k, pad_slot_id,
++                       W: tl.constexpr, WP2: tl.constexpr, HAS_INIT: tl.constexpr, HAS_CI: tl.constexpr,
++                       BLOCK_C: tl.constexpr):
++    b = tl.program_id(0)
++    c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
++    s = tl.load(qsl_ptr + b)
++    L = tl.load(qsl_ptr + b + 1) - s
++    zc = tl.zeros([BLOCK_C], dtype=tl.int32)  # per-sequence flags are broadcast to vectors before they meet masks
++    cm = c < C
++    if HAS_CI:
++        slot = tl.load(ci_ptr + b)
++        cm = cm & ((zc + slot) != pad_slot_id)
++    else:
++        slot = b
++    j = tl.arange(0, WP2)
++    idx = L + j  # index into xx = [init window (W-1) | x (L)]; new state[j] = xx[L + j]
++    from_x = idx >= (W - 1)
++    m = cm[:, None] & (j < (W - 1))[None, :]
++    val = tl.load(x_ptr + (s + idx - (W - 1))[None, :] * sx_t + c[:, None] * sx_c, mask=m & from_x[None, :], other=0.0)
++    if HAS_INIT:
++        hi = (zc + tl.load(init_ptr + b).to(tl.int32)) != 0
++        sv = tl.load(st_ptr + slot * ss_n + c[:, None] * ss_c + idx[None, :] * ss_k,
++                     mask=m & (~from_x)[None, :] & hi[:, None], other=0.0)
++        val = tl.where(from_x[None, :], val, sv)
++    # A sequence shorter than W-1 keeps part of its old state, shifted: element j reads old element L + j, which
++    # another thread of this program overwrites. Every load must land before any store.
++    tl.debug_barrier()
++    tl.store(st_ptr + slot * ss_n + c[:, None] * ss_c + j[None, :] * ss_k, val.to(st_ptr.dtype.element_ty), mask=m)
++
++
++def causal_conv1d_varlen_channel_last(x, weight, bias, conv_states, query_start_loc, cache_indices, has_initial_state,
++                                      silu, pad_slot_id, out, block_t=32, block_c=128, num_warps=4, split=True):
++    """x, out: (dim, total_tokens) views with stride(0) == 1 (token-major storage). weight: (dim, W).
++    conv_states: (slots, dim, W-1) or None. Updates conv_states in place (after the forward).
++    split=True: interior tiles in _conv_fwd_fast_kernel, then the boundary tiles in _conv_fwd_kernel (small grid)."""
++    C, T = x.shape
++    W = weight.shape[-1]
++    assert x.stride(0) == 1 and out.stride(0) == 1, "token-major (channel-last) x and out expected"
++    assert query_start_loc is not None
++    nseq = query_start_loc.shape[0] - 1
++    if T == 0 or nseq == 0:
++        return out
++    w = weight.reshape(C, W)
++    has_init = has_initial_state is not None and conv_states is not None
++    has_ci = cache_indices is not None
++    st = conv_states if conv_states is not None else x  # dummy pointer when absent
++    ss = conv_states.stride() if conv_states is not None else (0, 0, 0)
++    log2 = max(8, nseq.bit_length())  # constexpr: one compiled variant up to 255 sequences
++    b_arg = bias if bias is not None else w
++    ci_arg = cache_indices if has_ci else query_start_loc
++    init_arg = has_initial_state if has_init else query_start_loc
++    nc = triton.cdiv(C, block_c)
++    even_c = C % block_c == 0
++    if split:
++        _conv_fwd_fast_kernel[(triton.cdiv(T, block_t), nc)](
++            x, w, b_arg, query_start_loc, ci_arg, out, C, nseq, x.stride(1), x.stride(0), out.stride(1), out.stride(0),
++            w.stride(0), w.stride(1), pad_slot_id, W=W, HAS_BIAS=bias is not None, HAS_CI=has_ci, SILU=bool(silu),
++            LOG2_NSEQ=log2, EVEN_C=even_c, BLOCK_T=block_t, BLOCK_C=block_c, num_warps=num_warps)
++        grid = (2 * (nseq + 1), nc)
++    else:
++        grid = (triton.cdiv(T, block_t), nc)
++    _conv_fwd_kernel[grid](x, w, b_arg, st, query_start_loc, ci_arg, init_arg, out,
++                           T, C, nseq, x.stride(1), x.stride(0), out.stride(1), out.stride(0),
++                           w.stride(0), w.stride(1), ss[0], ss[1], ss[2], pad_slot_id,
++                           W=W, HAS_BIAS=bias is not None, HAS_INIT=has_init, HAS_CI=has_ci, SILU=bool(silu),
++                           LOG2_NSEQ=log2, EVEN_C=even_c, BOUNDARY_GRID=split, BLOCK_T=block_t, BLOCK_C=block_c,
++                           num_warps=num_warps)
++    if conv_states is not None:
++        bc = 256
++        _conv_state_kernel[(nseq, triton.cdiv(C, bc))](x, conv_states, query_start_loc, ci_arg, init_arg,
++                                                        C, x.stride(1), x.stride(0), ss[0], ss[1], ss[2], pad_slot_id,
++                                                        W=W, WP2=triton.next_power_of_2(max(2, W - 1)),
++                                                        HAS_INIT=has_init, HAS_CI=has_ci, BLOCK_C=bc,
++                                                        num_warps=4)
++    return out

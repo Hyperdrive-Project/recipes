@@ -1,0 +1,152 @@
+From 7c0dc78a6bd919cf5894fcd1d3a32346175f7a69 Mon Sep 17 00:00:00 2001
+From: Hyperdrive Project <noreply@hyperdrive-project.invalid>
+Date: Sun, 25 Oct 2026 14:15:49 +0000
+Subject: [PATCH 2/9] scheduler: make the short prompt tail a runtime option
+ (--prefill-short-tail N, --prefill-short-tail-keep-last)
+
+Default 0 keeps upstream behaviour (all 253 scheduler tests pass). keep-last stops a short
+tail at its last message boundary so reasoning re-renders can still restore there.
+
+---
+ flare/src/cli.rs               | 14 ++++++++++++++
+ flare/src/main.rs              |  6 ++++++
+ helios/src/scheduler/policy.rs | 32 +++++++++++++++++++++-----------
+ helios/src/server/config.rs    |  8 ++++++++
+ 4 files changed, 49 insertions(+), 11 deletions(-)
+
+diff --git a/flare/src/cli.rs b/flare/src/cli.rs
+index 6e06426c..4226515e 100644
+--- a/flare/src/cli.rs
++++ b/flare/src/cli.rs
+@@ -869,6 +869,14 @@ pub struct ServingOptions {
+         help_heading = "Advanced speculation options")]
+     pub mtp_adaptive_verification_alpha: Option<f64>,
+ 
++    /// Fork: prefill prompt tails of at most N tokens without stopping at message boundaries; 0 disables [default: 0].
++    #[arg(long, value_name = "N", help_heading = "Advanced speculation options")]
++    pub prefill_short_tail: Option<u64>,
++
++    /// Fork: with --prefill-short-tail, still stop at the tail's last message boundary.
++    #[arg(long, help_heading = "Advanced speculation options")]
++    pub prefill_short_tail_keep_last: bool,
++
+     /// Host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables [default: prefix_cache.memory, else disabled].
+     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
+     pub prefix_cache_memory: Option<u64>,
+@@ -990,6 +998,12 @@ impl ServingOptions {
+                 alpha.to_string(),
+             ]);
+         }
++        if let Some(tokens) = self.prefill_short_tail {
++            options.extend(["--prefill-short-tail".into(), tokens.to_string()]);
++        }
++        if self.prefill_short_tail_keep_last {
++            options.push("--prefill-short-tail-keep-last".into());
++        }
+         if let Some(storage) = self.embedding_table_storage {
+             options.extend([
+                 "--embedding-table-storage".into(),
+diff --git a/flare/src/main.rs b/flare/src/main.rs
+index 11cf1569..bd464992 100644
+--- a/flare/src/main.rs
++++ b/flare/src/main.rs
+@@ -260,6 +260,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+     if let Some(alpha) = args.serving.mtp_adaptive_verification_alpha {
+         config["mtp_adaptive_verification_alpha"] = alpha.into();
+     }
++    if let Some(tokens) = args.serving.prefill_short_tail {
++        config["prefill_short_tail_tokens"] = tokens.into();
++    }
++    if args.serving.prefill_short_tail_keep_last {
++        config["prefill_short_tail_keep_last"] = true.into();
++    }
+     config["scheduler_policy"] = args.scheduler_policy.into();
+     if let Some(value) = args.scheduler_terminal_value {
+         config["scheduler_terminal_value"] = value.into();
+diff --git a/helios/src/scheduler/policy.rs b/helios/src/scheduler/policy.rs
+index 8aab750c..3a50de7d 100644
+--- a/helios/src/scheduler/policy.rs
++++ b/helios/src/scheduler/policy.rs
+@@ -16,6 +16,10 @@ pub struct PolicyConfig {
+     pub adaptation_ms: f64,
+     pub estimate_ttl_ns: u64,
+     pub adaptive_verification_alpha: f64,
++    /// Fork: prompt tails of at most this many tokens prefill without stopping at message boundaries (0 = off).
++    pub prefill_short_tail_tokens: usize,
++    /// Fork: with a short tail, still stop at its last message boundary so that checkpoint publishes.
++    pub prefill_short_tail_keep_last: bool,
+ }
+ 
+ impl Default for PolicyConfig {
+@@ -30,6 +34,8 @@ impl Default for PolicyConfig {
+             adaptation_ms: 100.0,
+             estimate_ttl_ns: 30_000_000_000,
+             adaptive_verification_alpha: 1.0,
++            prefill_short_tail_tokens: 0,
++            prefill_short_tail_keep_last: false,
+         }
+     }
+ }
+@@ -95,8 +101,6 @@ impl Candidate {
+     }
+ }
+ 
+-/// Fork: see `prefill_work`; a cached conversational turn's new tokens rarely exceed this.
+-const SHORT_TAIL_TOKENS: usize = 512;
+ 
+ impl RequestScheduler {
+     pub(super) fn dominates_padding(&self, smaller: Candidate, larger: Candidate) -> bool {
+@@ -290,16 +294,22 @@ impl RequestScheduler {
+     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
+         let start = request.consumed_tokens as usize;
+         let limit = request.prefill_limit();
+-        // Short-tail turns (fork, robot latency): when the rest of the prompt is at most
+-        // SHORT_TAIL_TOKENS and fits one chunk, prefill it in one step instead of stopping at each
+-        // message boundary. Every prefill step reads most routed-expert weights, so a cached
+-        // conversational turn otherwise pays one full step per message boundary before its first
+-        // token. The final prompt and terminal checkpoints still publish; only intermediate message
+-        // checkpoints inside the short tail are skipped (a later divergent re-render recomputes at
+-        // most SHORT_TAIL_TOKENS).
++        // Short-tail turns (fork, robot latency; `--prefill-short-tail N`): when the rest of the prompt
++        // is at most N tokens and fits one chunk, prefill it without stopping at each message
++        // boundary. Every prefill step reads most routed-expert weights, so a cached conversational
++        // turn otherwise pays one full step per boundary before its first token. The prompt and
++        // terminal checkpoints still publish. With `--prefill-short-tail-keep-last` the step stops at
++        // the tail's last message boundary, so a following turn whose template re-renders this
++        // turn's reply (reasoning) can still restore there.
+         let tail = request.prompt_tokens.min(limit).saturating_sub(start);
+-        let mut end = if tail <= SHORT_TAIL_TOKENS && tail <= capacity {
+-            start + tail
++        let short = self.policy.prefill_short_tail_tokens;
++        let mut end = if short > 0 && tail <= short && tail <= capacity {
++            let last = request.message_boundaries.iter().rev()
++                .find(|&&n| start < n && n < start + tail).copied();
++            match last {
++                Some(n) if self.policy.prefill_short_tail_keep_last => n,
++                _ => start + tail,
++            }
+         } else {
+             request
+                 .message_boundaries
+diff --git a/helios/src/server/config.rs b/helios/src/server/config.rs
+index c25a600f..f5530f8a 100644
+--- a/helios/src/server/config.rs
++++ b/helios/src/server/config.rs
+@@ -326,6 +326,14 @@ impl Bootstrap {
+                 .filter(|v| v.is_finite() && *v > 0.0)
+                 .ok_or("adaptive verification alpha must be finite and greater than zero")?;
+         }
++        if let Some(value) = object.get("prefill_short_tail_tokens") {
++            scheduling_policy.prefill_short_tail_tokens = value.as_u64()
++                .ok_or("prefill short tail must be a nonnegative integer")? as usize;
++        }
++        if let Some(value) = object.get("prefill_short_tail_keep_last") {
++            scheduling_policy.prefill_short_tail_keep_last = value.as_bool()
++                .ok_or("prefill short tail keep-last must be a boolean")?;
++        }
+         let server = ServerConfig {
+             scheduling_policy,
+             api_key: Some(optional_text("api_key")?).filter(|key| !key.is_empty()),
+-- 
+2.43.0
+

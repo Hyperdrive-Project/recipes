@@ -1,0 +1,151 @@
+--- a/tensorrt_llm/_torch/pyexecutor/model_engine.py
++++ b/tensorrt_llm/_torch/pyexecutor/model_engine.py
+@@ -1047,6 +1047,13 @@
+                 and isinstance(decoder_model, DecoderModelForCausalLM)
+                 and getattr(self.model, "mm_encoder", None) is None):
+             return
++        # NHD patch (pcg-textonly): batches with image tokens fall back to eager in the decoder runner.
++        if (os.environ.get("NHD_PREFILL_GRAPH_TEXT_ONLY", "0") in ("1", "2")
++                and isinstance(decoder_model, DecoderModelForCausalLM)):
++            logger.warning(
++                "NHD_PREFILL_GRAPH_TEXT_ONLY=%s: breakable prefill CUDA graphs enabled for a multimodal model; "
++                "prefill batches carrying image tokens run eagerly." % os.environ["NHD_PREFILL_GRAPH_TEXT_ONLY"])
++            return
+         if (isinstance(self.model, MultimodalModelMixin) or isinstance(
+                 self.input_processor, BaseMultimodalInputProcessor)):
+             raise ValueError(
+--- a/tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/runner.py
++++ b/tensorrt_llm/_torch/pyexecutor/engine/runners/decoder/runner.py
+@@ -4410,6 +4410,18 @@
+                 mapping=self.mapping,
+                 dist=self.dist,
+             )
++        # NHD patch (pcg-textonly): prefill CUDA graphs only for batches without image tokens.
++        # Mode 1: any context request with multimodal payload -> eager. Mode 2: eager only when this forward holds
++        # image tokens (by token id, or by the per-request embed-mask cumsum). Unset/0: stock behaviour.
++        nhd_mode = os.environ.get("NHD_PREFILL_GRAPH_TEXT_ONLY", "0")
++        nhd_mm_eager = bool(multimodal_params_list) and nhd_mode in ("1", "2") and (
++            nhd_mode == "1"
++            or (mm_token_indices is not None and mm_token_indices.numel() > 0)
++            or any(
++                p.multimodal_runtime is None or p.multimodal_runtime.num_mm_tokens_in_chunk != 0
++                for p in multimodal_params_list
++            )
++        )
+         (padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens) = (
+             get_padding_params(
+                 total_num_tokens,
+@@ -4421,6 +4433,7 @@
+                     PrefillCudaGraphBackend.DISABLED
+                     if remote_tail_modes
+                     or scheduled_requests.attention_dp_phase is RemoteTailPhase.CONTEXT
++                    or nhd_mm_eager
+                     else self._config.prefill_cuda_graph_backend
+                 ),
+                 prefill_cuda_graph_num_tokens=self._config.prefill_cuda_graph_num_tokens,
+--- a/tensorrt_llm/_torch/models/modeling_nemotron_h_multimodal.py
++++ b/tensorrt_llm/_torch/models/modeling_nemotron_h_multimodal.py
+@@ -1,6 +1,8 @@
+ # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
++import contextlib
+ import copy
+ import math
++import os
+ import re
+ from dataclasses import dataclass
+ from functools import partial
+@@ -2875,6 +2877,12 @@
+ 
+         self.model_config = model_config
+         llm_model_config = copy.deepcopy(model_config)
++        if _NHD_PCG_TEXT_ONLY in ("1", "2"):
++            # NHD patch (pcg-textonly): the Mamba2 / attention boundary custom ops (torch.compile and breakable
++            # prefill graphs) look their layers up in the wrapper's extra_attrs (DecoderModelCaller); share the
++            # dict so the LLM layers register there (same as Qwen3-VL). The vision tower uses its own deep copy
++            # (_mm_model_config below), so its layers stay out of it.
++            llm_model_config.extra_attrs = model_config.extra_attrs
+         if hasattr(self, "llm"):
+             return
+ 
+@@ -3478,16 +3486,26 @@
+         text_token_indices = kwargs.get("text_token_indices")
+         evs_layout_updated = False
+         mm_embedding = []
+-        if len(multimodal_params) > 0:
++        if len(multimodal_params) > 0 and _nhd_no_mm_tokens_in_chunk(
++            multimodal_params[:num_context_requests], self.video_pruning_rate
++        ):
++            # NHD patch (pcg-textonly, mode 2): no image tokens in this chunk, so find_input_mm_embeds would slice the
++            # embeddings to nothing; skip the encoder (it may run inside a breakable-graph replay of this batch).
++            # Still order this stream after any side-stream encoder prefetch whose event the runner moved here.
++            for param in multimodal_params[:num_context_requests]:
++                if param.encoder_event is not None:
++                    torch.cuda.current_stream().wait_event(param.encoder_event)
++        elif len(multimodal_params) > 0:
+             ctx_params = multimodal_params[:num_context_requests]
+             raw_ctx_params = [param for param in ctx_params if has_raw_multimodal_payload(param)]
+             # Raw image/video/audio tensors: run local encoder.
+             if raw_ctx_params:
+                 self._check_encoders_exist(raw_ctx_params)
+-                mm_embedding = get_multimodal_embeddings(
+-                    encoder_forward_fn=partial(encode_multimodal_by_groups, self.mm_encoder_groups),
+-                    multimodal_params=ctx_params,
+-                )
++                with _nhd_breakable_graph_off():
++                    mm_embedding = get_multimodal_embeddings(
++                        encoder_forward_fn=partial(encode_multimodal_by_groups, self.mm_encoder_groups),
++                        multimodal_params=ctx_params,
++                    )
+             # E/P prefill: encoder already ran; use attached embeddings.
+             else:
+                 mm_embedding = get_attached_multimodal_embeddings(ctx_params)
+@@ -3606,6 +3624,49 @@
+                 llm_model_config._frozen = old_frozen
+ 
+ 
++# NHD patch (pcg-textonly): gate read once inside the serving container.
++_NHD_PCG_TEXT_ONLY = os.environ.get("NHD_PREFILL_GRAPH_TEXT_ONLY", "0")
++
++
++def _nhd_no_mm_tokens_in_chunk(ctx_params, video_pruning_rate) -> bool:
++    """Mode 2 only: True when every context request's current chunk holds zero multimodal embedding rows."""
++    if _NHD_PCG_TEXT_ONLY != "2" or not ctx_params or video_pruning_rate > 0:
++        return False
++    return all(
++        p.multimodal_runtime is not None and p.multimodal_runtime.num_mm_tokens_in_chunk == 0
++        for p in ctx_params
++    )
++
++
++@contextlib.contextmanager
++def _nhd_breakable_graph_off():
++    """Run the vision/audio encoders with the breakable-CUDA-graph flag cleared.
++
++    Under a breakable replay the flag is set for the whole outer forward; RADIO's TRTLLM attention would then take the
++    custom-op path that resolves the LLM's layers and metadata from extra_attrs. The runner keeps image chunks eager,
++    so this is a second line of defence.
++    """
++    if _NHD_PCG_TEXT_ONLY not in ("1", "2"):
++        yield
++        return
++    from ..pyexecutor.breakable_cuda_graph.context import _breakable_cuda_graph_active
++
++    token = _breakable_cuda_graph_active.set(False)
++    try:
++        yield
++    finally:
++        _breakable_cuda_graph_active.reset(token)
++
++
++def _nhd_apply_llm_torch_compile(self, *, backend, fullgraph: bool) -> None:
++    """Compile only the LLM decoder body (piecewise prefill graphs); the vision encoder stays eager."""
++    self.llm.model = torch.compile(self.llm.model, backend=backend, fullgraph=fullgraph)
++
++
++if _NHD_PCG_TEXT_ONLY in ("1", "2"):
++    NemotronHMultimodalModel.apply_llm_torch_compile = _nhd_apply_llm_torch_compile
++
++
+ def _rearrange_img(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+     py = x.shape[-2] // patch_size
+     px = x.shape[-1] // patch_size

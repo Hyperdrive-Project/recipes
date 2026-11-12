@@ -1,0 +1,12 @@
+--- a/tensorrt_llm/_torch/models/modeling_nemotron_h_multimodal.py
++++ b/tensorrt_llm/_torch/models/modeling_nemotron_h_multimodal.py
+@@ -674,6 +674,9 @@
+         self.vision_model = RADIOVisionModel(
+             vision_model_config,
+             disable_quantization=True,
++            # nemotron-hyperdrive: select the vision-tower attention backend (default FLASHINFER, whose cuDNN ragged-prefill
++            # plan build hangs on new image shapes when the LM runs with CUDA graphs on GB10; RESEARCH_LOG 2026-10-21).
++            vision_attn_backend=__import__("os").environ.get("NHD_VISION_ATTN_BACKEND", "FLASHINFER"),
+             encoder_cuda_graph_config=encoder_cuda_graph_config,
+         )
+ 

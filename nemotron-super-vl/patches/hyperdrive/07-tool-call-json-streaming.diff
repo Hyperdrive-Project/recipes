@@ -1,0 +1,204 @@
+--- a/tensorrt_llm/serve/tool_parser/qwen3_coder_parser.py
++++ b/tensorrt_llm/serve/tool_parser/qwen3_coder_parser.py
+@@ -3,6 +3,7 @@
+ import ast
+ import html
+ import json
++import math
+ import re
+ from typing import Any, Dict, List, Tuple
+ 
+@@ -53,6 +54,8 @@
+         ] = {}  # Track what parameter content we've streamed
+         self._in_tool_call: bool = False
+         self._function_name_sent: bool = False
++        # NHD tool-json: whether this call's opening "{" has been streamed (replaces brace counting).
++        self._args_opened: bool = False
+ 
+     def has_tool_call(self, text: str) -> bool:
+         return self.tool_call_start_token in text
+@@ -93,6 +96,7 @@
+                 self._current_function_name = ""
+                 self._current_parameters = {}
+                 self._streamed_parameters = {}
++                self._args_opened = False
+ 
+                 # Remove the start token
+                 self._buf = self._buf[len(self.tool_call_start_token) :]
+@@ -146,30 +150,24 @@
+             if self._function_name_sent:
+                 # Process parameters and get any calls to emit
+                 param_config = self._get_arguments_config(self._current_function_name, tools)
+-                parameter_calls = self._parse_and_stream_parameters(self._buf, param_config)
++                # NHD tool-json: only this call's text -- when one delta holds </tool_call> and the next call's
++                # parameters (stream_interval x accepted draft tokens), rc1 merged them into this call's arguments.
++                _end = self._buf.find(self.tool_call_end_token)
++                parameter_calls = self._parse_and_stream_parameters(
++                    self._buf if _end == -1 else self._buf[:_end], param_config
++                )
+                 calls.extend(parameter_calls)
+ 
+                 # Check if tool call is complete
+                 if self.tool_call_end_token in self._buf:
+                     end_pos = self._buf.find(self.tool_call_end_token)
+ 
+-                    # Add closing brace to complete the JSON object
+-                    current_streamed = self.streamed_args_for_tool[self.current_tool_id]
+-                    if current_streamed:
+-                        # Count opening and closing braces to check if JSON is complete
+-                        open_braces = current_streamed.count("{")
+-                        close_braces = current_streamed.count("}")
+-                        if open_braces > close_braces:
+-                            calls.append(
+-                                ToolCallItem(
+-                                    tool_index=self.current_tool_id,
+-                                    name=None,
+-                                    parameters="}",
+-                                )
+-                            )
+-                            self.streamed_args_for_tool[self.current_tool_id] = (
+-                                current_streamed + "}"
+-                            )
++                    # NHD tool-json: complete the JSON object without counting braces (string values may hold
++                    # braces), flushing parameters only the whole-parse rules can see, and emit "{}" for a
++                    # zero-parameter call (rc1 streamed "" there).
++                    calls.extend(
++                        self._close_streamed_arguments(self._buf[:end_pos], param_config, complete=True)
++                    )
+ 
+                     # Complete the tool call
+                     self._buf = self._buf[end_pos + len(self.tool_call_end_token) :]
+@@ -237,10 +235,12 @@
+                     )
+                 )
+                 self.streamed_args_for_tool[self.current_tool_id] = json_fragment
++                self._args_opened = True
+ 
+             else:
+                 # Additional parameters - add them incrementally
+-                new_keys = set(new_params.keys()) - set(self._current_parameters.keys())
++                # NHD tool-json: document order (rc1 iterated a set, so multi-key order followed the hash seed).
++                new_keys = [k for k in new_params if k not in self._current_parameters]
+                 if new_keys:
+                     # Build the continuation part (no closing brace yet)
+                     continuation_parts = []
+@@ -277,6 +277,77 @@
+         self._current_parameters = {}
+         self._streamed_parameters = {}
+         self.current_tool_name_sent = False
++        self._args_opened = False
++
++    # ---- NHD tool-json -------------------------------------------------------------------------------------------
++    def _whole_parse_params(self, body: str, param_config: dict) -> Dict[str, Any]:
++        """Parameters of one function body by the detect_and_parse rules (a parameter may end at </function>)."""
++        fend = body.find("</function>")
++        if fend != -1:
++            body = body[:fend]
++        params: Dict[str, Any] = {}
++        for pm in self.tool_call_parameter_regex.findall(body):
++            ptxt = pm[0] if pm[0] else pm[1]
++            if ">" not in ptxt:
++                continue
++            pidx = ptxt.index(">")
++            pname = ptxt[:pidx].strip()
++            pval = ptxt[pidx + 1 :].lstrip("\n").rstrip("\n")
++            params[pname] = self._convert_param_value(
++                pval, pname, param_config, self._current_function_name
++            )
++        return params
++
++    def _close_streamed_arguments(
++        self, body: str, param_config: dict, complete: bool
++    ) -> List[ToolCallItem]:
++        """Emit what turns this call's streamed arguments into one complete JSON object.
++
++        complete=True: the function body is whole (</function> or </tool_call> seen), so parameters the incremental
++        regex missed are flushed with the whole-parse rules first. complete=False (stream truncated mid-call): only
++        the complete parameters already streamed are kept.
++        """
++        tid = self.current_tool_id
++        frag = ""
++        if complete:
++            final = self._whole_parse_params(body, param_config)
++            missing = [k for k in final if k not in self._current_parameters]
++            if missing:
++                items = ", ".join(
++                    f"{json.dumps(k, ensure_ascii=False)}: {json.dumps(final[k], ensure_ascii=False)}"
++                    for k in missing
++                )
++                frag += (", " + items) if self._args_opened else ("{" + items)
++                self._args_opened = True
++                self._current_parameters = {
++                    **self._current_parameters,
++                    **{k: final[k] for k in missing},
++                }
++                self.prev_tool_call_arr[tid]["arguments"] = self._current_parameters
++        frag += "}" if self._args_opened else "{}"
++        self.streamed_args_for_tool[tid] = self.streamed_args_for_tool[tid] + frag
++        return [ToolCallItem(tool_index=tid, name=None, parameters=frag)]
++
++    def finish(self, tools: List[Tool]) -> StreamingParseResult:
++        """Close a tool call the stream ended inside (EOS after </function>, or max_tokens)."""
++        if not (self._in_tool_call and self._function_name_sent):
++            return StreamingParseResult()
++        param_config = self._get_arguments_config(self._current_function_name, tools)
++        calls = self._close_streamed_arguments(
++            self._buf, param_config, complete="</function>" in self._buf
++        )
++        self._buf = ""
++        self._reset_streaming_state()
++        self.current_tool_id += 1
++        return StreamingParseResult(normal_text="", calls=calls)
++
++    @staticmethod
++    def _strict_json_ok(value: Any) -> bool:
++        try:
++            json.dumps(value, ensure_ascii=False, allow_nan=False)
++            return True
++        except (TypeError, ValueError, OverflowError):
++            return False
+ 
+     def _extract(self, text: str, tools: List[Tool]) -> Tuple[str, List[ToolCallItem]]:
+         normal_parts: List[str] = []
+@@ -361,6 +432,7 @@
+         """Convert parameter value based on its type in the schema."""
+         # Copy and modify from `vllm/entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py`.
+         param_value = html.unescape(param_value.strip())
++        raw_value = param_value  # NHD tool-json: strict-JSON fallback
+         if param_value.lower() == "null":
+             return None
+ 
+@@ -400,12 +472,14 @@
+         elif param_type.startswith("num") or param_type.startswith("float"):
+             try:
+                 float_param_value = float(param_value)
++                if not math.isfinite(float_param_value):  # NHD tool-json: inf/nan are not JSON
++                    raise ValueError(param_value)
+                 return (
+                     float_param_value
+                     if float_param_value - int(float_param_value) != 0
+                     else int(float_param_value)
+                 )
+-            except (ValueError, TypeError):
++            except (ValueError, TypeError, OverflowError):
+                 logger.warning(
+                     f"Parsed value '{param_value}' of parameter '{param_name}' is not a float "
+                     f"in tool '{func_name}', degenerating to string."
+@@ -427,7 +501,9 @@
+             ):
+                 try:
+                     param_value = json.loads(param_value)
+-                    return param_value
++                    if self._strict_json_ok(param_value):  # NHD tool-json: json.loads accepts NaN
++                        return param_value
++                    param_value = raw_value
+                 except (json.JSONDecodeError, TypeError, ValueError):
+                     logger.warning(
+                         f"Parsed value '{param_value}' of parameter '{param_name}' cannot be "
+@@ -440,4 +516,6 @@
+                     f"Parsed value '{param_value}' of parameter '{param_name}' cannot be "
+                     f"converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
+                 )
++            if not self._strict_json_ok(param_value):  # NHD tool-json: sets, bytes, complex, inf ...
++                return raw_value
+             return param_value

@@ -1,0 +1,53 @@
+From 6f1471ffd17bb66fc06a0628434c3fef62d87144 Mon Sep 17 00:00:00 2001
+From: Hyperdrive Project <noreply@hyperdrive-project.invalid>
+Date: Mon, 26 Oct 2026 06:48:17 +0000
+Subject: [PATCH 9/9] ignition: map default/audit autotune tiers onto the
+ pinned b12x tier names
+
+Upstream 2bd1d1c8 renamed Ignition tiers to off/default/audit, but the locked flashinfer (43eaf93f) still
+accepts only off/low/medium/high/max, so every export failed with ValueError. default maps to medium
+and audit to max; other names pass through.
+
+Validation: the three tiers enter the b12x effort context on CPU. Limitation: fork-only shim until the lock moves.
+
+---
+ ignition/preparation/tuning.py | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/ignition/preparation/tuning.py b/ignition/preparation/tuning.py
+index 939f57f4..9ad9f426 100644
+--- a/ignition/preparation/tuning.py
++++ b/ignition/preparation/tuning.py
+@@ -27,11 +27,19 @@ _COLLECTIVES_PER_JOB = 96
+ _REQUESTS_PER_JOB = 192
+ 
+ 
++# Fork: the pinned flashinfer b12x still names its tiers off/low/medium/high/max; map Ignition's tiers onto them.
++_B12X_EFFORT = {"default": "medium", "audit": "max"}
++
++
++def _b12x_effort(effort):
++    return _B12X_EFFORT.get(getattr(effort, "value", effort), effort)
++
++
+ def with_autotune_effort(prepare):
+     """Apply the preparation config's effort throughout bootstrap declarations."""
+     @wraps(prepare)
+     def scoped(snapshot, config, *args, **kwargs):
+-        with b12x_autotune_effort(config.autotune_effort):
++        with b12x_autotune_effort(_b12x_effort(config.autotune_effort)):
+             return prepare(snapshot, config, *args, **kwargs)
+ 
+     return scoped
+@@ -63,7 +71,7 @@ class RecordedPreparationSession(PreparationSession):
+             raise ValueError("tuning namespace cannot override its workload identity")
+         identity.update(checkpoint=checkpoint, workload_schema=workload_schema,
+                         numerical_policy=numerical_policy)
+-        self.autotune_effort = AutotuneEffort(autotune_effort).value
++        self.autotune_effort = AutotuneEffort(_b12x_effort(autotune_effort)).value
+         self.native_dense_activations = native_dense_activations
+         with b12x_autotune_effort(self.autotune_effort):
+             super().__init__(device=device, autotune=self.autotune_effort != "off", compile_workers=0,
+-- 
+2.43.0
+

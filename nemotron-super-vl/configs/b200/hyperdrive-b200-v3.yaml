@@ -1,0 +1,64 @@
+# Part of Hyperdrive recipes, https://github.com/Hyperdrive-Project/recipes
+# Apache-2.0. If this helps you, a credit to Hyperdrive recipes is appreciated.
+# Hyperdrive on B200, v3 (2026-11-03): hyperdrive-b200.yaml plus the v2 changes
+# block reuse off, lossless rejection sampling for MTP, 64K prefill
+# chunks. Env: hyperdrive-b200-v3.env; checkpoint: super-vl-nvfp4-m4 (scripts/make_fp4_mamba.sh).
+# Measured at 128 users, 8K in / 1K out, unique prompts: 6,280 burst / 6,307 sustained output tok/s (one B200,
+# 2026-11-03 ~1 AM PST). v2 on B200 (same stack without FP4 Mamba projections): 5,660 / 5,679.
+# Quality: v3 itself was not gated on B200. The same weights and kernels passed on B300 (math 49/50, code 29/30, tools
+# 11/11, reasoning on), and on B200 v3 + FP8 MoE latent projections passed (49/50, 29/30, 11/11).
+# Block reuse is off for this benchmark (no shared prefixes); for chat with shared system prompts or multi-turn, set it true.
+stream_interval: 4
+prefill_cuda_graph_backend: breakable
+trust_remote_code: true
+dtype: bfloat16
+tensor_parallel_size: 1
+moe_expert_parallel_size: 1
+max_batch_size: 128
+max_num_tokens: 65536
+max_seq_len: 131072
+enable_chunked_prefill: true
+disable_overlap_scheduler: false
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 6
+  - 8
+  - 12
+  - 16
+  - 24
+  - 32
+  - 48
+  - 64
+  - 96
+  - 128
+attn_backend: TRTLLM
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.85
+  host_cache_size: 0
+  mamba_ssm_cache_dtype: float16
+  mamba_ssm_stochastic_rounding: false
+  enable_block_reuse: false
+  use_kv_cache_manager_v2: true
+  mamba_state_config:
+    enable_branch_snapshot: true
+    additional_snapshot_offsets_from_end:
+    - 1
+    - 576
+nvfp4_gemm_config:
+  allowed_backends:
+  - cutlass
+  - cublaslt
+  - cuda_core
+moe_config:
+  backend: CUTEDSL
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+  use_rejection_sampling: true
+guided_decoding_backend: xgrammar

@@ -1,0 +1,18 @@
+{
+ "label": "after",
+ "voice": {
+  "rounds": 4163.0,
+  "tokens_per_round": 2.8306509728561133,
+  "draft_accept_rate": 0.27830074825006035,
+  "gpu_tok_s": 56.99406015099011,
+  "t1_p50_ms": 84.2,
+  "t5_p50_ms": 182.1,
+  "t8_p50_ms": 231.1
+ },
+ "speed_bench_qualitative": {
+  "rounds": 3754.0,
+  "tokens_per_round": 5.465636654235482,
+  "draft_accept_rate": 0.6471268800617046,
+  "gpu_tok_s": 109.32550055874297
+ }
+}

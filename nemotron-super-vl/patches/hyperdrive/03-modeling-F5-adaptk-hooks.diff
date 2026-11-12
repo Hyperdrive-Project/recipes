@@ -1,0 +1,210 @@
+--- a/tensorrt_llm/_torch/models/modeling_nemotron_h.py	2026-10-23 02:02:45.880560960 +0000
++++ b/tensorrt_llm/_torch/models/modeling_nemotron_h.py	2026-10-23 02:02:46.061562611 +0000
+@@ -163,6 +163,75 @@
+                                **kwargs)
+ 
+ 
++# --- Nemotron Hyperdrive MegaKernel F1: mega-gate (opt-in: NHD_F1=1) ------------------------------------------------
++# router gate GEMV + fc1_latent GEMV + DeepSeek-V3 top-22 routing in one kernel (megakernel/csrc/nhd_mega_gate.cu);
++# the MoE backend's routing call is served from its result. Decode/verify only (M <= 32); prefill is unchanged.
++# Not bit-identical (fp32 summation order); checked by megakernel/bench/mk_f1.py. NHD_F1=0/unset: upstream.
++def _nhd_f1(moe, x2d):
++    mg = moe.__dict__.get("_nhd_f1_mg", False)
++    if mg is False:
++        import os
++        mg = None
++        if os.environ.get("NHD_F1", "0") == "1" and getattr(moe, "use_latent_moe", False):
++            import sys
++            mk_dir = os.environ.get("NHD_MK_DIR", "/nhd-mk")
++            if mk_dir not in sys.path:
++                sys.path.insert(0, mk_dir)
++            from nhd_mk.mega_gate import MegaGate
++            try:
++                mg = MegaGate(moe)
++            except Exception as ex:  # unsupported shape/dtype: keep the upstream path for this layer
++                logger.warning(f"[nhd] F1 mega-gate disabled for layer {moe.layer_idx}: {ex}")
++                mg = None
++        moe.__dict__["_nhd_f1_mg"] = mg
++    if mg is None:
++        return None
++    if not mg.eligible(x2d):
++        mg.stash = None
++        return None
++    return mg(x2d)
++
++
++# --- NHD adaptive verify length (dflash-adaptk; opt-in: NHD_ADAPTK=1) -------------------------------------------------
++# Verify rows past a request's verify length (dflash.py: worker._nhd_vlen per drafter slot) take the router logits of
++# that request's last verified row, so they pick the same experts and add no unique experts to the routed GEMMs.
++# Their drafts are force-rejected in dflash.py, and rows <= vlen are untouched. Unset: _NHD_ADAPTK_SRC stays None.
++_NHD_ADAPTK_ON = None
++_NHD_ADAPTK_SRC = None
++_NHD_ADAPTK_LOGGED = False
++
++
++def _nhd_adaptk_rows(attn_metadata, spec_metadata, num_tokens):
++    global _NHD_ADAPTK_ON, _NHD_ADAPTK_LOGGED
++    if _NHD_ADAPTK_ON is None:
++        import os
++        _NHD_ADAPTK_ON = os.environ.get("NHD_ADAPTK", "0") == "1"
++    if not _NHD_ADAPTK_ON or spec_metadata is None:
++        return None
++    w = getattr(spec_metadata, "_dflash_worker", None)
++    vlen = getattr(w, "_nhd_vlen", None) if w is not None else None
++    if vlen is None or getattr(w, "_batch_to_slot", None) is None:
++        return None
++    nc = attn_metadata.num_contexts
++    ng = attn_metadata.num_seqs - nc
++    T = int(getattr(spec_metadata, "runtime_draft_len", 0) or 0) + 1
++    if ng <= 0 or T <= 1:
++        return None
++    n_ctx_tok = num_tokens - ng * T
++    if n_ctx_tok < 0:
++        return None
++    dev = vlen.device
++    vl = vlen[w._batch_to_slot[nc:nc + ng]].long()
++    j = torch.arange(T, device=dev)
++    rj = torch.minimum(j[None, :], vl[:, None])
++    gen = (n_ctx_tok + torch.arange(ng, device=dev)[:, None] * T + rj).flatten()
++    src = torch.cat([torch.arange(n_ctx_tok, device=dev), gen]) if n_ctx_tok else gen
++    if not _NHD_ADAPTK_LOGGED:
++        _NHD_ADAPTK_LOGGED = True
++        logger.info(f"[nhd-adaptk] routing override engaged (tokens={num_tokens}, gens={ng}, T={T})")
++    return src
++
++
+ class NemotronHMOE(nn.Module):
+ 
+     def __init__(
+@@ -386,17 +455,25 @@
+             return shared_expert_output
+ 
+         def _compute_routed_output():
+-            # Gate uses high precision input for accurate routing decisions.
+-            router_logits = self.gate(hidden_states_hp_2d)
+-
+-            if self.use_latent_moe:
+-                routed_hidden_states = self.fc1_latent_proj(
+-                    hidden_states_hp,
+-                    lora_params=lora_params,
+-                    layer_idx=self.layer_idx)
++            _nhd_out = _nhd_f1(self, hidden_states_hp_2d) if lora_params is None else None
++            if _nhd_out is not None:
++                router_logits, routed_hidden_states = _nhd_out
+             else:
+-                # Use bf16; fused norm's swizzled SF is incompatible with MoE alltoall.
+-                routed_hidden_states = hidden_states_hp
++                # Gate uses high precision input for accurate routing decisions.
++                router_logits = self.gate(hidden_states_hp_2d)
++                # NHD adaptk: rows past the verify length reuse their request's last verified row's routing.
++                if (_NHD_ADAPTK_SRC is not None
++                        and _NHD_ADAPTK_SRC.shape[0] == router_logits.shape[0]):
++                    router_logits = router_logits.index_select(0, _NHD_ADAPTK_SRC)
++
++                if self.use_latent_moe:
++                    routed_hidden_states = self.fc1_latent_proj(
++                        hidden_states_hp,
++                        lora_params=lora_params,
++                        layer_idx=self.layer_idx)
++                else:
++                    # Use bf16; fused norm's swizzled SF is incompatible with MoE alltoall.
++                    routed_hidden_states = hidden_states_hp
+ 
+             final_hidden_states = self.experts(
+                 routed_hidden_states,
+@@ -441,6 +518,26 @@
+         return final_hidden_states.view(orig_shape)
+ 
+ 
++# --- Nemotron Hyperdrive MegaKernel F5: fused add+RMSNorm+FP8 for the Mamba in_proj input (opt-in: NHD_F5=1) -------
++# One kernel instead of [flashinfer fused_add_rmsnorm -> BF16 -> static_quantize_e4m3_per_tensor], bit-exact by design
++# (megakernel/nhd_mk/norm_quant.py; checked by megakernel/bench/mk_f5.py). Decode and prefill. NHD_F5=0/unset: upstream.
++def _nhd_f5(layer, hidden_states, residual):
++    nq = layer.__dict__.get("_nhd_f5_mod", False)
++    if nq is False:
++        import os
++        nq = None
++        if layer.layer_type == "M" and os.environ.get("NHD_F5", "0") == "1":
++            import sys
++            mk_dir = os.environ.get("NHD_MK_DIR", "/nhd-mk")
++            if mk_dir not in sys.path:
++                sys.path.insert(0, mk_dir)
++            from nhd_mk import norm_quant as nq
++        layer.__dict__["_nhd_f5_mod"] = nq
++    if nq is None or not nq.eligible(layer.norm, layer.mixer.in_proj, hidden_states, residual):
++        return None
++    return nq.norm_fp8(layer.norm, hidden_states, residual, layer.mixer.in_proj.input_scale)
++
++
+ class NemotronHLayer(DecoderLayer):
+ 
+     def __init__(
+@@ -663,6 +760,8 @@
+             hidden_states, residual, high_precision_normed_output = self.norm(
+                 hidden_states, residual)
+             hidden_states = (hidden_states, high_precision_normed_output)
++        elif (_nhd_fused := _nhd_f5(self, hidden_states, residual)) is not None:
++            hidden_states, residual = _nhd_fused
+         else:
+             hidden_states, residual = self.norm(hidden_states, residual)
+ 
+@@ -686,6 +785,33 @@
+         return hidden_states, residual
+ 
+ 
++# --- Nemotron Hyperdrive MegaKernel step 1: L2 weight prefetch on a side stream (opt-in) -------------------------------
++# NHD_L2_PREFETCH=1 enables it (unset/0: this file behaves exactly as upstream). The schedule lives in the mounted
++# package nhd_mk (NHD_MK_DIR, default /nhd-mk = ~/nemotron-hyperdrive/megakernel); see megakernel/DESIGN.md.
++# Forks are captured only inside CUDA-graph capture (decode/verify graphs); eager steps are untouched.
++def _nhd_l2_prefetch(model):
++    import os
++    if "_nhd_sync_debug" not in model.__dict__:
++        # Diagnostic only (DeepInfer-style hidden-sync hunt): NHD_SYNC_DEBUG=warn|error sets
++        # torch.cuda.set_sync_debug_mode in the process that runs the model, once, at its first forward.
++        model.__dict__["_nhd_sync_debug"] = os.environ.get("NHD_SYNC_DEBUG", "")
++        if model.__dict__["_nhd_sync_debug"] in ("warn", "error"):
++            torch.cuda.set_sync_debug_mode(model.__dict__["_nhd_sync_debug"])
++            logger.info(f"[nhd] torch.cuda.set_sync_debug_mode({model.__dict__[_nhd_sync_debug]!r})")
++    if os.environ.get("NHD_L2_PREFETCH", "0") in ("", "0"):
++        return None
++    pf = model.__dict__.get("_nhd_l2_pf")
++    if pf is None:
++        import sys
++        mk_dir = os.environ.get("NHD_MK_DIR", "/nhd-mk")
++        if mk_dir not in sys.path:
++            sys.path.insert(0, mk_dir)
++        from nhd_mk.nemotron_h import from_env
++        pf = from_env(list(model.layers[:model.num_hidden_layers]), log=logger.info)
++        model.__dict__["_nhd_l2_pf"] = pf
++    return pf
++
++
+ class NemotronHModel(DecoderModel):
+ 
+     def __init__(self, model_config: NemotronHModelConfig):
+@@ -781,7 +907,14 @@
+ 
+         hidden_states = inputs_embeds
+         residual = torch.zeros_like(hidden_states)
+-        for layer in self.layers[:self.num_hidden_layers]:
++        global _NHD_ADAPTK_SRC  # NHD adaptk
++        _NHD_ADAPTK_SRC = _nhd_adaptk_rows(attn_metadata, spec_metadata, hidden_states.shape[0])
++        _nhd_pf = _nhd_l2_prefetch(self)
++        if _nhd_pf is not None and not _nhd_pf.begin():
++            _nhd_pf = None
++        for _nhd_i, layer in enumerate(self.layers[:self.num_hidden_layers]):
++            if _nhd_pf is not None:
++                _nhd_pf.before_layer(_nhd_i)
+             hidden_states, residual = layer(
+                 position_ids,
+                 hidden_states,
+@@ -791,6 +924,9 @@
+                 lora_params=lora_params,
+                 mamba_metadata=mamba_metadata,
+             )
++        if _nhd_pf is not None:
++            _nhd_pf.end()
++        _NHD_ADAPTK_SRC = None  # NHD adaptk
+ 
+         if self.fuse_allreduce_norm:
+             hidden_states, _ = self.final_allreduce(

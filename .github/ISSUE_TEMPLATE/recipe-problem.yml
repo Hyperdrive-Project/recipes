@@ -1,0 +1,22 @@
+name: Recipe problem or different results
+description: A recipe doesn't run, or your numbers differ from RECIPES.md
+labels: ["recipe"]
+body:
+  - type: dropdown
+    id: recipe
+    attributes:
+      label: Recipe
+      options: [Nemotron Super VL - TensorRT-LLM, Nemotron Super VL - SGLang, Nemotron Super VL - vLLM, Nemotron Super VL - DGX Spark, Qwen Flash-Next - DGX Spark, Bolt + Flare voice - DGX Spark]
+    validations: {required: true}
+  - type: input
+    id: hw
+    attributes: {label: GPU, driver, CUDA}
+    validations: {required: true}
+  - type: textarea
+    id: cmd
+    attributes: {label: Exact commands and config, render: bash}
+    validations: {required: true}
+  - type: textarea
+    id: result
+    attributes: {label: What happened (logs, numbers, quality scores)}
+    validations: {required: true}

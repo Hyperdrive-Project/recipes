@@ -1,0 +1,23 @@
+# Nemotron Hyperdrive (trt-loop, 2026-11-02): NHD_WEIGHT_OVERLAY=<file> loads a safetensors file after the checkpoint's
+# shards and lets its tensors replace or extend them (cell m4: the FP4 Mamba in_proj / out_proj from jobs/m4_convert.py,
+# without a 70 GB copy of the shards). TRT-LLM reads every *.safetensors of the directory concurrently, so a second file
+# with the same tensor names would race; the overlay is applied after all shards, in one place. Unset: stock.
+diff -ruN -x __pycache__ a/tensorrt_llm/_torch/models/checkpoints/hf/weight_loader.py b/tensorrt_llm/_torch/models/checkpoints/hf/weight_loader.py
+--- a/tensorrt_llm/_torch/models/checkpoints/hf/weight_loader.py	2026-11-02 16:27:51.081275358 +0000
++++ b/tensorrt_llm/_torch/models/checkpoints/hf/weight_loader.py	2026-11-02 16:27:51.102307790 +0000
+@@ -1023,6 +1023,15 @@
+         run_concurrently(load_func, [(w, ) for w in weight_files],
+                          reduce_func=weights.update,
+                          pbar=pbar)
++        # Nemotron Hyperdrive (trt-loop, 2026-11-02): NHD_WEIGHT_OVERLAY=<file> (a safetensors file not named
++        # *.safetensors, so the glob above skips it) replaces and adds tensors after the shards are read: a converted
++        # subset of the weights (FP4 Mamba projections) without rewriting the 70 GB of shards that hold them.
++        overlay = os.environ.get("NHD_WEIGHT_OVERLAY")
++        if overlay:
++            extra = safetensors.torch.load_file(overlay)
++            logger.info(f"NHD weight overlay {overlay}: {len(extra)} tensors, "
++                        f"{sum(k in weights for k in extra)} replace checkpoint tensors")
++            weights.update(extra)
+ 
+         return ConsumableWeightsDict(weights)
+ 

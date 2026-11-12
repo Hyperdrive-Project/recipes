@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use these recipes, configs, patches or results, please cite Hyperdrive recipes."
+title: "Hyperdrive recipes: tuned serving recipes for open source models and engines"
+type: software
+authors:
+  - name: "Hyperdrive Project"
+repository-code: "https://github.com/Hyperdrive-Project/recipes"
+license: Apache-2.0
+version: "2026.11"
+date-released: "2026-11-10"
+keywords:
+  - llm-inference
+  - tensorrt-llm
+  - vllm
+  - sglang
+  - nvfp4
+  - dgx-spark
+  - blackwell

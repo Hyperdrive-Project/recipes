@@ -1,0 +1,10 @@
+# Part of Hyperdrive recipes, https://github.com/Hyperdrive-Project/recipes
+# Flare configuration for Bolt on one DGX Spark (pass with --config). Replace /home/USER with your home directory.
+[memory]
+reserve = "4G"
+
+[paths]
+hub_cache = "/home/USER/flare-voice/hub"
+kernel_cache = "/home/USER/flare-voice/cache/kernels"
+package_cache = "/home/USER/flare-voice/cache/packages"
+cuda = "/usr/local/cuda-13.0"

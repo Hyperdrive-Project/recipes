@@ -1,0 +1,61 @@
+From 7439b987662a3b1725c2ae5b3750381fd740d7aa Mon Sep 17 00:00:00 2001
+From: Hyperdrive Project <noreply@hyperdrive-project.invalid>
+Date: Mon, 26 Oct 2026 04:42:00 +0000
+Subject: [PATCH 7/9] tests: set stable_history in upstream request fixtures
+ added since the fork point
+
+Rebase follow-up: four RequestSpec literals in new upstream tests lacked the fork field.
+Validation: 1218 Helios lib tests pass (--features runtime-package,server). Tests only.
+
+---
+ helios/src/model/tests.rs            | 2 +-
+ helios/src/scheduler/policy_tests.rs | 6 +++---
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/helios/src/model/tests.rs b/helios/src/model/tests.rs
+index 27fc9bf8..e1d52205 100644
+--- a/helios/src/model/tests.rs
++++ b/helios/src/model/tests.rs
+@@ -1653,7 +1653,7 @@ fn committed_generation_cursors_require_feedback_while_unused_prompt_positions_d
+                 scheduler.fixed_speculative_width(Some(8)).unwrap();
+             }
+             scheduler.measured_graph_durations(&manifest.graphs).unwrap();
+-            let handle = scheduler.admit(RequestSpec { message_boundaries: vec![], prompt: vec![7; 64], conditioning: vec![],
++            let handle = scheduler.admit(RequestSpec { stable_history: false, message_boundaries: vec![], prompt: vec![7; 64], conditioning: vec![],
+                 max_new_tokens: 64, grammar_constrained: false, host_stops: false, prompt_logprobs: false, growable_output: false }).unwrap();
+             let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
+             admissions[handle.slot as usize] = Some(Admission { handle, sampling: SamplingParameters::default(),
+diff --git a/helios/src/scheduler/policy_tests.rs b/helios/src/scheduler/policy_tests.rs
+index 1f9dc42b..6660269c 100644
+--- a/helios/src/scheduler/policy_tests.rs
++++ b/helios/src/scheduler/policy_tests.rs
+@@ -1147,7 +1147,7 @@ fn long_conversations_budget_checkpoints_and_cross_unselected_messages() {
+     let mut s = interactive_engine(32, false);
+     let mut handles = Vec::new();
+     for id in 1..=4 {
+-        handles.push(s.admit(RequestSpec {
++        handles.push(s.admit(RequestSpec { stable_history: false,
+             prompt: vec![id; 32768],
+             message_boundaries: (32..32768).step_by(32).collect(),
+             conditioning: vec![],
+@@ -2680,7 +2680,7 @@ fn terminal_snapshot_publishes_exact_partial_page_for_shared_cache_geometries()
+         let publications = s.stats().snapshot_publications;
+         let fence = Fence(s.submitted.0 + 1);
+         s.commit(&plan, fence).unwrap();
+-        let spec = RequestSpec { prompt: vec![1; page_tokens + 1], message_boundaries: vec![],
++        let spec = RequestSpec { stable_history: false, prompt: vec![1; page_tokens + 1], message_boundaries: vec![],
+             conditioning: vec![], max_new_tokens: 1, grammar_constrained: false,
+             host_stops: false, prompt_logprobs: false, growable_output: false };
+         assert_eq!(s.plan_admission(&spec).unwrap().resident_tokens(), 0);
+@@ -2768,7 +2768,7 @@ fn feedback_prefill_tails_progress_before_existing_generations_finish() {
+             }
+             let handles = (0..4)
+                 .map(|id| {
+-                    s.admit(RequestSpec {
++                    s.admit(RequestSpec { stable_history: false,
+                         prompt: vec![id; 87],
+                         message_boundaries: vec![42, 82, 87],
+                         conditioning: vec![],
+-- 
+2.43.0
+

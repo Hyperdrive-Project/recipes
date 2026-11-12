@@ -1,0 +1,125 @@
+# Nemotron Hyperdrive (trt-loop, 2026-11-02): NHD_GUIDED_SKIP=1 skips the grammar host functions, bitmask copies and
+# GPU drains (4 per step) of one-model speculative decoding in eager steps whose batch has no guided request, where they
+# are no-ops; they kept the GPU idle ~19 ms per 32K prefill step and ~16 ms per mixed step (j21, j22 py-spy). Batches
+# with a guided request, CUDA-graph steps and the first eager step after graph replays keep the stock path.
+diff -ruN -x __pycache__ a/tensorrt_llm/_torch/pyexecutor/guided_decoder.py b/tensorrt_llm/_torch/pyexecutor/guided_decoder.py
+--- a/tensorrt_llm/_torch/pyexecutor/guided_decoder.py	2026-11-02 13:11:14.212499901 +0000
++++ b/tensorrt_llm/_torch/pyexecutor/guided_decoder.py	2026-11-02 13:11:38.121449523 +0000
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import math
++import os
+ from dataclasses import dataclass
+ from queue import Queue
+ from typing import Iterable, List, Optional, Tuple
+@@ -20,6 +21,18 @@
+ from .llm_request import LlmRequest
+ from .scheduler import ScheduledRequests
+ 
++# Nemotron Hyperdrive (trt-loop, 2026-11-02): NHD_GUIDED_SKIP=1. With guided decoding configured, every eager
++# (not CUDA-graph) step of one-model speculative decoding enqueues the grammar host functions and then waits on
++# the GPU (_drain_host_functions) after the target logits and after each draft step, 4 times per step, even when no
++# request in the batch is guided. Each wait empties the GPU queue, and the GPU then idles while the host launches
++# the next kernels (prefill and mixed steps, ~19 ms per 383 ms prefill step and ~16 ms per mixed step on B300).
++# For such a batch every one of those calls is a no-op (_build sets token_mask only for guided rows, so the bitmask
++# kernel leaves the logits unchanged, and the host functions only touch guided requests), so the step skips them.
++# It does so only when the previous step's guided calls also ran eagerly, so no host function of an earlier step
++# (a CUDA-graph host node) can still be pending while this step continues without draining; the first eager step
++# after graph replays keeps the stock path and drains them. Batches with a guided request always keep it.
++_NHD_GUIDED_SKIP = os.environ.get("NHD_GUIDED_SKIP", "0") == "1"
++
+ 
+ def row_has_valid_token(row: torch.Tensor, vocab_size_padded: int) -> bool:
+     """Whether a filled next-token bitmask row allows at least one token.
+@@ -512,6 +525,11 @@
+         # self.requests_hostfunc should be accessed by hostfunc (CUDA callback).
+         self.requests_hostfunc: Optional[GuidedRequests] = None
+         self.queue = Queue()
++        # NHD_GUIDED_SKIP state, see _nhd_skip.
++        self._nhd_no_guided = False
++        self._nhd_step_skip: Optional[bool] = None
++        self._nhd_cur_eager = False
++        self._nhd_prev_eager = False
+ 
+         self.new_tokens = torch.empty(self.max_num_draft_tokens + 1,
+                                       self.max_num_sequences,
+@@ -562,9 +580,33 @@
+         if new_tokens is not None:
+             self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
+         self.queue.put((self.requests, new_tokens is not None))
++        if _NHD_GUIDED_SKIP:
++            self._nhd_prev_eager, self._nhd_cur_eager = self._nhd_cur_eager, False
++            self._nhd_no_guided = not any(
++                req.guided_decoding_params is not None
++                for req in self.requests.requests)
++            self._nhd_step_skip = None
+         # self.token_event.record() should be called inside CUDA graph capturing;
+         # currently, it is in DecoderRunner._preprocess_inputs.
+ 
++    def _nhd_skip(self) -> bool:
++        """NHD_GUIDED_SKIP: True when this eager step's guided-decoding calls are no-ops and can be skipped.
++
++        The first eager call of a step decides for the whole step. A skipped step consumes its own queue entry
++        here (the newest one; older entries belong to CUDA-graph host nodes that have not run yet and pop from the
++        front) instead of in fetch_batch, so the queue stays aligned with the steps.
++        """
++        if not _NHD_GUIDED_SKIP or torch.cuda.is_current_stream_capturing():
++            return False
++        self._nhd_cur_eager = True
++        if self._nhd_step_skip is None:
++            self._nhd_step_skip = self._nhd_no_guided and self._nhd_prev_eager
++            if self._nhd_step_skip:
++                with self.queue.mutex:
++                    if self.queue.queue:
++                        self.queue.queue.pop()
++        return self._nhd_step_skip
++
+     @hostfunc
+     def fetch_batch(self) -> None:
+         # CUDA graph warmup calls model forward for multiple times for one prepared inputs
+@@ -588,6 +630,8 @@
+     def execute(self,
+                 logits: torch.Tensor,
+                 d2t: Optional[torch.Tensor] = None) -> List[Tuple[int, str]]:
++        if self._nhd_skip():
++            return []
+         with torch.cuda.stream(self.stream):
+             torch.cuda.current_stream().wait_event(self.token_event)
+             self.fetch_batch()
+@@ -619,6 +663,8 @@
+                         new_tokens: torch.Tensor,
+                         num_accepted_tokens: torch.Tensor,
+                         draft_step: int = 0) -> None:
++        if self._nhd_skip():
++            return
+         batch_size = len(self.requests)
+         assert new_tokens.size(0) == batch_size
+         self.new_tokens[0, :batch_size].copy_(new_tokens, non_blocking=True)
+@@ -661,6 +707,8 @@
+         Args:
+             num_accepted_tokens: Int32 tensor of shape [batch_size].
+         """
++        if self._nhd_skip():
++            return
+         batch_size = len(self.requests)
+         assert num_accepted_tokens.size(0) == batch_size
+         self.num_accepted_tokens[:batch_size].copy_(num_accepted_tokens,
+@@ -697,6 +745,8 @@
+             num_accepted_tokens: Int32 tensor of shape [batch_size], including
+                 the bonus token in each verification count.
+         """
++        if self._nhd_skip():
++            return
+         self.add_accepted_batch(num_accepted_tokens)
+         with torch.cuda.stream(self.stream):
+             torch.cuda.current_stream().wait_event(self.token_event)
+@@ -711,6 +761,8 @@
+                             logits: torch.Tensor,
+                             d2t: Optional[torch.Tensor] = None,
+                             draft_step: int = 0) -> List[Tuple[int, str]]:
++        if self._nhd_skip():
++            return []
+         with torch.cuda.stream(self.stream):
+             torch.cuda.current_stream().wait_event(self.token_event)
+             self.fetch_draft_batch(draft_step=draft_step)

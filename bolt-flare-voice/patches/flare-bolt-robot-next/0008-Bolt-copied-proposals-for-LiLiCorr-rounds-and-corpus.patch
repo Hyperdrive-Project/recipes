@@ -1,0 +1,336 @@
+From 6592817d2473bffc14758e8349a8974a7e1c41b3 Mon Sep 17 00:00:00 2001
+From: Hyperdrive Project <noreply@hyperdrive-project.invalid>
+Date: Mon, 26 Oct 2026 04:46:48 +0000
+Subject: [PATCH 8/9] Bolt: copied proposals for LiLiCorr rounds and
+ corpus-seeded decoded history
+
+Ignition: the shared parallel draft round accepts host-prepared copied proposals when its owner exposes
+copy buffers (only Nemotron-H opts in here). A copied token replaces the learned draft at its position with a
+point-mass proposal while every earlier position was also copied, so stochastic verification stays exact.
+Nemotron-H speculative graphs bind the existing copy inputs (token ids, count, cursor, generation).
+
+Helios: --history-seed PATH preloads the shared decoded history from a corpus (little-endian u32 ids,
+u32::MAX ends each response) before admission; the window grows to fit the corpus. The lookup, expiry and
+proposal path are unchanged. Requires --history-drafts.
+
+Validation: 1219 Helios lib tests pass, including a new seeded-history test; Ignition modules import.
+Limitation: not yet exported or measured on GPU; the copied-proposal path needs a Bolt re-export and the
+voice acceptance eval before use.
+
+---
+ flare/src/cli.rs                          |  7 ++++++
+ flare/src/main.rs                         |  3 +++
+ helios/src/scheduler.rs                   | 22 +++++++++++++++++++
+ helios/src/scheduler/decoded_history.rs   | 22 +++++++++++++++++++
+ helios/src/server.rs                      |  4 ++++
+ helios/src/server/config.rs               |  6 ++++++
+ helios/src/server/runtime.rs              |  8 +++++++
+ helios/src/server/runtime/prompt_tests.rs |  2 +-
+ ignition/components/parallel_draft.py     | 26 +++++++++++++++++++++--
+ ignition/recipes/nemotron_h/bootstrap.py  |  4 +++-
+ ignition/recipes/nemotron_h/dflash.py     | 10 +++++++++
+ 11 files changed, 110 insertions(+), 4 deletions(-)
+
+diff --git a/flare/src/cli.rs b/flare/src/cli.rs
+index 4226515e..cfba6cc8 100644
+--- a/flare/src/cli.rs
++++ b/flare/src/cli.rs
+@@ -877,6 +877,10 @@ pub struct ServingOptions {
+     #[arg(long, help_heading = "Advanced speculation options")]
+     pub prefill_short_tail_keep_last: bool,
+ 
++    /// Fork: preload --history-drafts from a corpus (little-endian u32 ids, u32::MAX ends each response).
++    #[arg(long, value_name = "PATH", help_heading = "Advanced speculation options")]
++    pub history_seed: Option<std::path::PathBuf>,
++
+     /// Host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables [default: prefix_cache.memory, else disabled].
+     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
+     pub prefix_cache_memory: Option<u64>,
+@@ -1004,6 +1008,9 @@ impl ServingOptions {
+         if self.prefill_short_tail_keep_last {
+             options.push("--prefill-short-tail-keep-last".into());
+         }
++        if let Some(path) = &self.history_seed {
++            options.extend(["--history-seed".into(), path.display().to_string()]);
++        }
+         if let Some(storage) = self.embedding_table_storage {
+             options.extend([
+                 "--embedding-table-storage".into(),
+diff --git a/flare/src/main.rs b/flare/src/main.rs
+index bd464992..f4ac64ee 100644
+--- a/flare/src/main.rs
++++ b/flare/src/main.rs
+@@ -266,6 +266,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+     if args.serving.prefill_short_tail_keep_last {
+         config["prefill_short_tail_keep_last"] = true.into();
+     }
++    if let Some(path) = &args.serving.history_seed {
++        config["history_seed"] = path.display().to_string().into();
++    }
+     config["scheduler_policy"] = args.scheduler_policy.into();
+     if let Some(value) = args.scheduler_terminal_value {
+         config["scheduler_terminal_value"] = value.into();
+diff --git a/helios/src/scheduler.rs b/helios/src/scheduler.rs
+index e5701cf4..cb727f51 100644
+--- a/helios/src/scheduler.rs
++++ b/helios/src/scheduler.rs
+@@ -954,6 +954,28 @@ impl RequestScheduler {
+         Ok(())
+     }
+ 
++    /// Fork: preload decoded history from a corpus file of little-endian u32 token ids, with
++    /// u32::MAX ending each response. Returns the number of seeded tokens.
++    pub fn seed_history(&mut self, path: &std::path::Path) -> Result<usize> {
++        if self.submitted != Fence(0) || self.admissions != 0 {
++            return Err("decoded history must be seeded before admission".into());
++        }
++        let bytes = std::fs::read(path).map_err(|e| format!("history seed {}: {e}", path.display()))?;
++        if bytes.len() % 4 != 0 {
++            return Err("history seed must hold whole u32 token ids".into());
++        }
++        let mut sequences = vec![Vec::new()];
++        for word in bytes.chunks_exact(4) {
++            match u32::from_le_bytes(word.try_into().unwrap()) {
++                u32::MAX => sequences.push(Vec::new()),
++                token => sequences.last_mut().unwrap().push(token),
++            }
++        }
++        let tokens = sequences.iter().map(Vec::len).sum();
++        self.decoded_history = Some(decoded_history::DecodedHistory::seeded(&sequences));
++        Ok(tokens)
++    }
++
+     pub fn history_proposal(&self, context: &[u32], maximum: usize) -> ([i64; 7], usize) {
+         self.decoded_history.as_ref().map_or(([-1; 7], 0), |history| history.lookup(context, maximum))
+     }
+diff --git a/helios/src/scheduler/decoded_history.rs b/helios/src/scheduler/decoded_history.rs
+index 90f1680f..c480a5e6 100644
+--- a/helios/src/scheduler/decoded_history.rs
++++ b/helios/src/scheduler/decoded_history.rs
+@@ -69,6 +69,18 @@ pub(crate) struct DecodedHistory {
+ impl DecodedHistory {
+     pub(crate) fn new() -> Self { Self::with_capacity(CAPACITY) }
+ 
++    /// History preloaded with token sequences (each an independent response), oldest first, so a later
++    /// sequence wins a shared context. The window grows to hold the corpus plus live responses.
++    pub(crate) fn seeded(sequences: &[Vec<u32>]) -> Self {
++        let tokens: usize = sequences.iter().map(Vec::len).sum();
++        let mut history = Self::with_capacity(CAPACITY.max((2 * tokens).next_power_of_two()));
++        for tokens in sequences {
++            let mut sequence = DecodedSequence::default();
++            for &token in tokens { history.append(&mut sequence, token); }
++        }
++        history
++    }
++
+     fn with_capacity(capacity: usize) -> Self {
+         assert!(capacity.is_power_of_two());
+         Self {
+@@ -194,6 +206,16 @@ mod tests {
+         assert_eq!(cache.lookup(&[6, 7, 8], 7), ([-1; 7], 0));
+     }
+ 
++    #[test]
++    fn seeded_corpus_proposes_its_continuations_and_later_sequences_win() {
++        let cache = DecodedHistory::seeded(&[vec![1, 2, 3, 4, 5, 6], vec![1, 2, 3, 4, 9]]);
++        assert_eq!(cache.lookup(&[1, 2, 3, 4], 7), ([9, -1, -1, -1, -1, -1, -1], 1));
++        assert_eq!(cache.lookup(&[2, 3, 4, 5], 7), ([6, -1, -1, -1, -1, -1, -1], 1));
++        assert_eq!(cache.ring.len(), CAPACITY);
++        let large = DecodedHistory::seeded(&[vec![7; CAPACITY]]);
++        assert_eq!(large.ring.len(), 2 * CAPACITY);
++    }
++
+     #[test]
+     fn delayed_continuation_does_not_replace_a_more_recent_context() {
+         let mut cache = DecodedHistory::with_capacity(32);
+diff --git a/helios/src/server.rs b/helios/src/server.rs
+index 5c98e537..8f47e67e 100644
+--- a/helios/src/server.rs
++++ b/helios/src/server.rs
+@@ -69,6 +69,8 @@ pub struct ServerConfig {
+     /// Setting that raises request or page capacity, appended to capacity rejections.
+     pub capacity_hint: String,
+     pub scheduling_policy: crate::scheduler::PolicyConfig,
++    /// Fork: corpus preloaded into decoded history (see RequestScheduler::seed_history).
++    pub history_seed: Option<std::path::PathBuf>,
+ }
+ impl Default for ServerConfig {
+     fn default() -> Self {
+@@ -83,6 +85,7 @@ impl Default for ServerConfig {
+             context_hint: String::new(),
+             capacity_hint: String::new(),
+             scheduling_policy: crate::scheduler::PolicyConfig::default(),
++            history_seed: None,
+         }
+     }
+ }
+@@ -198,6 +201,7 @@ impl Server {
+                 frontend.clone(),
+                 peers,
+                 config.scheduling_policy,
++                config.history_seed.clone(),
+             )?
+         });
+         let state = Arc::new(HttpState {
+diff --git a/helios/src/server/config.rs b/helios/src/server/config.rs
+index f5530f8a..8232ed14 100644
+--- a/helios/src/server/config.rs
++++ b/helios/src/server/config.rs
+@@ -334,7 +334,13 @@ impl Bootstrap {
+             scheduling_policy.prefill_short_tail_keep_last = value.as_bool()
+                 .ok_or("prefill short tail keep-last must be a boolean")?;
+         }
++        let history_seed = match object.get("history_seed") {
++            None | Some(Value::Null) => None,
++            Some(Value::String(path)) if !path.is_empty() => Some(std::path::PathBuf::from(path)),
++            _ => return Err("history_seed must be a nonempty path".into()),
++        };
+         let server = ServerConfig {
++            history_seed,
+             scheduling_policy,
+             api_key: Some(optional_text("api_key")?).filter(|key| !key.is_empty()),
+             served_names,
+diff --git a/helios/src/server/runtime.rs b/helios/src/server/runtime.rs
+index 4164b01b..ee8c8650 100644
+--- a/helios/src/server/runtime.rs
++++ b/helios/src/server/runtime.rs
+@@ -336,6 +336,7 @@ impl ModelRuntime {
+         frontend: Arc<crate::frontend::Frontend>,
+         peers: Option<crate::execution::RankPeers>,
+         policy: crate::scheduler::PolicyConfig,
++        history_seed: Option<std::path::PathBuf>,
+     ) -> Result<Self> {
+         crate::model::catalog::validate(&config, &manifest)?;
+         super::observation::initialize_clock();
+@@ -438,6 +439,13 @@ impl ModelRuntime {
+                             Ok(())
+                         }
+                     })
++                    .and_then(|()| match &history_seed {
++                        Some(path) if worker_config.history_drafts => scheduler.seed_history(path).map(|tokens| {
++                            eprintln!("[history] seeded {tokens} tokens from {}", path.display());
++                        }),
++                        Some(_) => Err("--history-seed requires --history-drafts".into()),
++                        None => Ok(()),
++                    })
+                     .and_then(|()| {
+                         scheduler.fixed_speculative_width(worker_config.speculative_fixed_width)
+                     })
+diff --git a/helios/src/server/runtime/prompt_tests.rs b/helios/src/server/runtime/prompt_tests.rs
+index 6f5b2990..e0c9f94d 100644
+--- a/helios/src/server/runtime/prompt_tests.rs
++++ b/helios/src/server/runtime/prompt_tests.rs
+@@ -26,7 +26,7 @@ fn prompt_prefill_gpu_and_native_costs() {
+         "page_tokens":config.contract.cache.page_tokens,"graphs":manifest.graphs.len()}));
+     let scoring = manifest.prompt_logprob_capacity().unwrap() > 0;
+     let runtime = unsafe { ModelRuntime::start(manifest, config, 16, 256, frontend,
+-        None, crate::scheduler::PolicyConfig::default()).unwrap() };
++        None, crate::scheduler::PolicyConfig::default(), None).unwrap() };
+     runtime.metrics().scheduler_trace.start();
+     let asynchronous = tokio::runtime::Runtime::new().unwrap();
+     let mut samples = VecDeque::new();
+diff --git a/ignition/components/parallel_draft.py b/ignition/components/parallel_draft.py
+index 68396f62..0121122e 100644
+--- a/ignition/components/parallel_draft.py
++++ b/ignition/components/parallel_draft.py
+@@ -189,6 +189,10 @@ class PreparedParallelDraftRound:
+         for tensor in retained.values():
+             tensor.zero_()
+         self.valid = torch.zeros((b, w - 1), dtype=torch.bool, device=device)
++        # Owners exposing copy_ids accept host-prepared copied proposals (decoded-history drafts).
++        self.copies = getattr(o, "copy_ids", None) is not None and generate_proposals and not proposal_only
++        self.copy_mask = torch.zeros(b, dtype=torch.int64, device=device)
++        self.copy_live = torch.zeros(b, dtype=torch.bool, device=device)
+         self.seed, self.offset, self.base_offset, self.sampled = (
+             torch.zeros_like(self.before) for _ in range(4)
+         )
+@@ -252,6 +256,7 @@ class PreparedParallelDraftRound:
+             o.frame,
+             o.sequence,
+             logits=self.decoder.scratch.logits.view(b, w, -1), rng=o.rng,
++            copy_offered_mask=self.copy_mask if self.copies else None,
+             draft_context_lag=0,
+             token_limits=o.inputs.query_lengths[:b],
+         )
+@@ -294,6 +299,11 @@ class PreparedParallelDraftRound:
+             )
+             self.draft()
+             self.markov_token.copy_(torch.where(self.active, self.candidates[:, 0], 0))
++            if self.copies:
++                self.copy_mask.zero_()
++                # A copy stays usable only while every earlier position was also copied.
++                self.copy_live.copy_(self.active & (o.copy_generation[safe] == o.requests.generation[safe])
++                                     & (o.copy_expected[safe] == self.before))
+             if self.argmax is not None:
+                 # Greedy drafts: each position's shard logits plus its Markov bias, from the previous draft.
+                 for i in range(w - 1):
+@@ -316,9 +326,21 @@ class PreparedParallelDraftRound:
+                     observer.record_embedding(i, self.markov.embedding)
+                 self.offset.copy_(self.base_offset + 4 * i)
+                 proposal()
++                if self.copies and i < o.copy_ids.shape[1]:
++                    copied = o.copy_ids[safe, i]
++                    self.copy_live.logical_and_((i < o.copy_count[safe]) & (copied >= 0)
++                                                & (copied < o.requests.vocab_size) & (i < limits - 1))
++                    self.sampled.copy_(torch.where(self.copy_live, copied, self.sampled))
++                    point = torch.zeros_like(proposal.probabilities[:, 0]).scatter_(
++                        1, self.sampled.clamp_min(0)[:, None], 1.0)
++                    self.probabilities[:, i].copy_(torch.where(self.copy_live[:, None], point,
++                                                               proposal.probabilities[:, 0]))
++                    self.valid[:, i].copy_((self.copy_live | proposal.valid[:, 0]) & self.active & (i < limits - 1))
++                    self.copy_mask.bitwise_or_(self.copy_live.long() << i)
++                else:
++                    self.probabilities[:, i].copy_(proposal.probabilities[:, 0])
++                    self.valid[:, i].copy_(proposal.valid[:, 0] & self.active & (i < limits - 1))
+                 self.drafts[:, i].copy_(self.sampled)
+-                self.probabilities[:, i].copy_(proposal.probabilities[:, 0])
+-                self.valid[:, i].copy_(proposal.valid[:, 0] & self.active & (i < limits - 1))
+                 self.markov_token.copy_(self.sampled)
+             if advance_rng:
+                 self.commit_draft_rng()
+diff --git a/ignition/recipes/nemotron_h/bootstrap.py b/ignition/recipes/nemotron_h/bootstrap.py
+index 6e9f6301..427f1063 100644
+--- a/ignition/recipes/nemotron_h/bootstrap.py
++++ b/ignition/recipes/nemotron_h/bootstrap.py
+@@ -180,6 +180,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
+         speculation = SpeculativePreparation(weights, pool, requests, inputs, completion=completion, frame=frame,
+             sequence=sequence, session=session, workspace=arena, coordinator=coordinator,
+             buffers=graph_buffers, layer_buffers=layer_buffers)
++        buffers.update(speculation.copy_buffers())
+     modes = (True, False) if drafting else (False,)
+     count = (len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes))
+              + len(batch_sizes) + len(config.speculative_round_shapes) + len(PATCH_CAPACITIES))
+@@ -233,7 +234,8 @@ def prepare(snapshot, config, *, progress=None, package_storage):
+                 forward = PreparedParallelDraftRound(speculation, batch, width, name,
+                     buffers=speculation.cursor, target_token_capacity=packed)
+                 forward.prepare()
+-                add(name, forward, "speculative", batch, width, (*inputs.buffers(), "sampling_grammar_mask"),
++                add(name, forward, "speculative", batch, width,
++                    (*inputs.buffers(), "sampling_grammar_mask", *speculation.copy_buffers()),
+                     enabled=True, packed_tokens=packed)
+         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
+         for enabled in modes:
+diff --git a/ignition/recipes/nemotron_h/dflash.py b/ignition/recipes/nemotron_h/dflash.py
+index 3e8c46a8..eed735ca 100644
+--- a/ignition/recipes/nemotron_h/dflash.py
++++ b/ignition/recipes/nemotron_h/dflash.py
+@@ -215,6 +215,16 @@ class SpeculativePreparation:
+         self.generation, self.offset = torch.zeros_like(requests.generation), torch.zeros_like(requests.generation)
+         self.block_size, self.logit_offset = weights.config.draft.block_size, 1
+         self.draft_scratch = None
++        # Copied proposals (Helios --history-drafts): host-prepared continuations that replace learned drafts.
++        device, capacity = pool.backing.device, requests.capacity
++        self.copy_ids = torch.full((capacity, 7), -1, dtype=torch.int64, device=device)
++        self.copy_count = torch.zeros(capacity, dtype=torch.int32, device=device)
++        self.copy_expected = torch.full((capacity,), -1, dtype=torch.int64, device=device)
++        self.copy_generation = torch.zeros(capacity, dtype=torch.int64, device=device)
++
++    def copy_buffers(self):
++        return {"copy_token_ids": self.copy_ids, "copy_token_count": self.copy_count,
++                "copy_expected_consumed": self.copy_expected, "copy_generation": self.copy_generation}
+ 
+     def begin(self, batch, width, target_token_capacity):
+         self.cursor = self.buffers.cursor()
+-- 
+2.43.0
+

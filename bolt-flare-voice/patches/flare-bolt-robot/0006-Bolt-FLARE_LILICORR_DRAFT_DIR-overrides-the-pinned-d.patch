@@ -1,0 +1,40 @@
+From d14b6e1a4f668921189d839e89db0cde3b9654c4 Mon Sep 17 00:00:00 2001
+From: Hyperdrive Project <noreply@hyperdrive-project.invalid>
+Date: Sun, 25 Oct 2026 21:18:34 +0000
+Subject: [PATCH 6/6] Bolt: FLARE_LILICORR_DRAFT_DIR overrides the pinned
+ drafter snapshot
+
+Preparation-time only: when set, the nemotron_h recipe prepares speculation from a local drafter
+directory in the released LiLiCorr layout (same keys, dtypes and config) instead of downloading
+the pinned revision. Unset keeps upstream behavior. Helios is untouched.
+
+Validation: none on GPU yet (CPU-only window); the recipe module imports. Limitation: the env var
+is a fork convenience for drafter fine-tunes, not a declared recipe input.
+
+---
+ ignition/recipes/nemotron_h/recipe.py | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/ignition/recipes/nemotron_h/recipe.py b/ignition/recipes/nemotron_h/recipe.py
+index a4fc9cec..b820152a 100644
+--- a/ignition/recipes/nemotron_h/recipe.py
++++ b/ignition/recipes/nemotron_h/recipe.py
+@@ -13,11 +13,13 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
+         raise ValueError("Nemotron-H preparation requires one local GPU")
+     drafting = {}
+     if plan.speculation is not None:
++        import os
+         from huggingface_hub import snapshot_download
+         from .draft_config import REPOSITORY, REVISION
+ 
+-        draft = snapshot_download(REPOSITORY, revision=REVISION, cache_dir=plan.hub_cache,
+-                                  allow_patterns=("config.json", "model.safetensors"))
++        # Local fine-tuned drafter in the released layout (same keys, dtypes and config); unset uses the pinned release.
++        draft = os.environ.get("FLARE_LILICORR_DRAFT_DIR") or snapshot_download(REPOSITORY, revision=REVISION,
++            cache_dir=plan.hub_cache, allow_patterns=("config.json", "model.safetensors"))
+         drafting = dict(draft_checkpoint=draft, speculative_widths=plan.speculation.widths,
+             speculative_fixed_width=plan.speculation.fixed_width, speculative_token_capacity=plan.speculative_token_capacity)
+     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
+-- 
+2.43.0
+

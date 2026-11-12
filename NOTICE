@@ -1,0 +1,30 @@
+Hyperdrive
+Copyright 2026 the Hyperdrive contributors. Licensed under the Apache License 2.0 (LICENSE).
+Source: https://github.com/Hyperdrive-Project/recipes
+
+If you use or share these recipes, configs, patches or results, we'd appreciate a credit to "Hyperdrive recipes"
+with a link to the source above. Citation details: CITATION.cff.
+
+This repository contains or derives from third-party work:
+
+- patches/hyperdrive/*.diff, patches/v3/*.diff: diffs against NVIDIA TensorRT-LLM 1.4.0rc1
+  (https://github.com/NVIDIA/TensorRT-LLM, commit 0372799d), Apache License 2.0. Only diffs are shipped, not TRT-LLM sources.
+- patches/hyperdrive/nhd_mk/fi_norm_exact.py: generated from FlashInfer 0.6.18 flashinfer/norm/kernels/fused_add_rmsnorm.py,
+  Copyright (c) 2025 by FlashInfer team, Apache License 2.0 (header kept in the file).
+- scripts/fetch_flashinfer_cake.sh downloads FlashInfer's CAKE Mamba-2 SSD sources (github.com/flashinfer-ai/flashinfer,
+  commit e74a167, Apache License 2.0) at image build time; they are not shipped here.
+- qwen-flash-next/mods/*.py and qwen-flash-next/fancycake-48/nvfp4_csf.py: modified vLLM files (Apache License 2.0,
+  SPDX headers kept), for the eugr/spark-vllm-b12x image.
+- bolt-flare-voice/patches/flare-bolt-robot*/*.patch: patches against NVIDIA Flare
+  (https://github.com/NVIDIA/flare-local-inference), Apache License 2.0. Only patches are shipped.
+- bolt-flare-voice/patches/model-optimizer/*.patch: patches against NVIDIA Model-Optimizer, Apache License 2.0.
+- correctness/data/gsm8k_test_50.jsonl: 50 problems from openai/gsm8k (MIT). correctness/data/humaneval_30.jsonl: 30 problems
+  from openai/openai_humaneval (MIT). Exact revisions, indices and sha256s in correctness/data/MANIFEST.json.
+
+The model weights (nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4, its LiLiCorr drafter, and
+nvidia/Qwen3.8-Flash-Next-FP4-Local) are not included and are
+governed by NVIDIA's own license. NVIDIA, TensorRT-LLM, DGX Spark, Blackwell and Nemotron are trademarks of NVIDIA Corporation.
+This project is independent and not endorsed by NVIDIA.
+
+- assets/banner-*.svg and assets/highlights-*.svg embed the Hyperdrive Display, Sans and Mono fonts, which are derived
+  from Geist and Geist Mono and released under the SIL Open Font License 1.1 (assets/FONTS-OFL.txt).

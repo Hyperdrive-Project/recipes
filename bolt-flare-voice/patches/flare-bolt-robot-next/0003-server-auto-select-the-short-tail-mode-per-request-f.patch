@@ -1,0 +1,121 @@
+From 949c7b92bdfe2eafab5f234017a9178ba2497282 Mon Sep 17 00:00:00 2001
+From: Hyperdrive Project <noreply@hyperdrive-project.invalid>
+Date: Sun, 25 Oct 2026 14:32:41 +0000
+Subject: [PATCH 3/9] server: auto-select the short-tail mode per request from
+ template stability
+
+Prompts rendered with enable_thinking=false re-render earlier turns unchanged, so their
+message boundaries inside the final --prefill-short-tail tokens are dropped at admission and
+the tail prefills in one step even with --prefill-short-tail-keep-last; reasoning prompts keep
+them and stop at the tail's last boundary. 952 Helios lib tests pass.
+
+---
+ helios/src/scheduler/policy.rs            |  5 +++++
+ helios/src/server/request.rs              |  4 ++++
+ helios/src/server/runtime.rs              | 13 ++++++++++++-
+ helios/src/server/runtime/phase_tests.rs  |  1 +
+ helios/src/server/runtime/prompt_tests.rs |  2 +-
+ 5 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/helios/src/scheduler/policy.rs b/helios/src/scheduler/policy.rs
+index 3a50de7d..9cad4196 100644
+--- a/helios/src/scheduler/policy.rs
++++ b/helios/src/scheduler/policy.rs
+@@ -169,6 +169,11 @@ impl RequestScheduler {
+         retained
+     }
+ 
++    /// Fork: `--prefill-short-tail` tokens (0 when disabled).
++    pub fn prefill_short_tail_tokens(&self) -> usize {
++        self.policy.prefill_short_tail_tokens
++    }
++
+     pub fn configure_policy(&mut self, policy: PolicyConfig) -> Result<()> {
+         if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
+             return Err("scheduling policy must be configured before admission".into());
+diff --git a/helios/src/server/request.rs b/helios/src/server/request.rs
+index 2d092a27..19105619 100644
+--- a/helios/src/server/request.rs
++++ b/helios/src/server/request.rs
+@@ -342,10 +342,14 @@ pub(super) fn prepare_inference_cached(
+     if ignore_eos && grammar.is_some() {
+         return Err("structured output cannot ignore end-of-sequence tokens".into());
+     }
++    let stable_history = options.get("enable_thinking")
++        .or_else(|| frontend.template_default("enable_thinking"))
++        == Some(&Value::Bool(false));
+     Ok(PreparedInference {
+         prompt: Prompt {
+             tokens,
+             message_boundaries,
++            stable_history,
+             data,
+             conditioned_inputs,
+             conditioning,
+diff --git a/helios/src/server/runtime.rs b/helios/src/server/runtime.rs
+index 68ea37ca..1b48b777 100644
+--- a/helios/src/server/runtime.rs
++++ b/helios/src/server/runtime.rs
+@@ -24,6 +24,10 @@ pub struct Prompt {
+     pub tokens: Vec<u32>,
+     /// Sorted token counts of exact rendered message prefixes.
+     pub message_boundaries: Vec<usize>,
++    /// Fork: the template renders earlier turns as they were generated (thinking disabled), so the
++    /// terminal checkpoint of the previous turn stays reusable and message checkpoints inside a
++    /// short final tail are unnecessary.
++    pub stable_history: bool,
+     pub data: crate::model::PromptData,
+     pub conditioned_inputs: Vec<crate::frontend::images::PreparedImageInput>,
+     pub conditioning: Vec<ConditioningEvent>,
+@@ -1101,8 +1105,14 @@ impl<'a> Worker<'a> {
+                 incoming.reject_admission("logprobs are not available in this model package".into());
+                 continue;
+             }
++            let short_tail = self.scheduler.prefill_short_tail_tokens();
++            let mut message_boundaries = incoming.prompt.message_boundaries.clone();
++            if short_tail > 0 && incoming.prompt.stable_history {
++                let tail_start = incoming.prompt.tokens.len().saturating_sub(short_tail);
++                message_boundaries.retain(|&n| n <= tail_start);
++            }
+             let spec = RequestSpec {
+-                message_boundaries: incoming.prompt.message_boundaries.clone(),
++                message_boundaries,
+                 prompt: incoming.prompt.tokens.clone(),
+                 conditioning: incoming.prompt.conditioning.clone(),
+                 max_new_tokens: incoming.prompt.max_new_tokens,
+@@ -2498,6 +2508,7 @@ mod tests {
+             prompt: Prompt {
+                 tokens: vec![7],
+                 message_boundaries: vec![],
++                stable_history: false,
+                 data: PromptData {
+                     positions: vec![[0; 3]],
+                     vision_token_indices: vec![-1],
+diff --git a/helios/src/server/runtime/phase_tests.rs b/helios/src/server/runtime/phase_tests.rs
+index a2e9bf0d..bad991da 100644
+--- a/helios/src/server/runtime/phase_tests.rs
++++ b/helios/src/server/runtime/phase_tests.rs
+@@ -166,6 +166,7 @@ impl Fixture {
+                 prompt: Prompt {
+                     tokens,
+                     message_boundaries: vec![],
++                    stable_history: false,
+                     data,
+                     conditioned_inputs: vec![],
+                     conditioning: vec![],
+diff --git a/helios/src/server/runtime/prompt_tests.rs b/helios/src/server/runtime/prompt_tests.rs
+index 3a935a73..6f5b2990 100644
+--- a/helios/src/server/runtime/prompt_tests.rs
++++ b/helios/src/server/runtime/prompt_tests.rs
+@@ -40,7 +40,7 @@ fn prompt_prefill_gpu_and_native_costs() {
+                     let mut tokens = vec![42; length];
+                     tokens[0] = 100 + serial;
+                     let prompt = Prompt {
+-                        tokens, message_boundaries: vec![],
++                        tokens, message_boundaries: vec![], stable_history: false,
+                         data: crate::model::PromptData { positions: (0..length).map(|i| [i as i64; 3]).collect(),
+                             vision_token_indices: vec![-1; length], spans: vec![] },
+                         conditioned_inputs: vec![], conditioning: vec![], sampling: crate::model::SamplingParameters {
+-- 
+2.43.0
+

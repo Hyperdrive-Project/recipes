@@ -1,0 +1,9 @@
+models/
+runs/
+results/aiperf-*/
+__pycache__/
+*.pyc
+.venv/
+aiperf-venv/
+*.egg-info/
+cache/

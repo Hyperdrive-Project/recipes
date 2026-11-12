@@ -1,0 +1,72 @@
+From ee45fb97a00cf395ebfe8a630ffb06be427fa49f Mon Sep 17 00:00:00 2001
+From: Hyperdrive Project <noreply@hyperdrive-project.invalid>
+Date: Sun, 25 Oct 2026 13:49:48 +0000
+Subject: [PATCH 1/6] scheduler: prefill a short prompt tail in one step (fork
+ experiment)
+
+A cached conversational turn adds a few dozen tokens across two or three message
+boundaries. Prefill stopped at each boundary to publish a message checkpoint, and
+each step reads most routed-expert weights, so Bolt paid three ~70 ms prefill steps
+before its first token (graph trace, 2026-10-25). When the rest of the prompt is at
+most 512 tokens and fits one chunk, prefill it in one step; the prompt and terminal
+checkpoints still publish.
+
+Experimental fork change (bolt-robot), not proposed upstream. Upstream's boundary
+tests that assert per-message checkpoints inside short prompts now fail by design
+(8 of 253 scheduler tests). A configurable limit is follow-up work.
+
+---
+ helios/src/scheduler/policy.rs | 30 +++++++++++++++++++++++-------
+ 1 file changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/helios/src/scheduler/policy.rs b/helios/src/scheduler/policy.rs
+index ef07aba0..9bbfa93a 100644
+--- a/helios/src/scheduler/policy.rs
++++ b/helios/src/scheduler/policy.rs
+@@ -90,6 +90,9 @@ impl Candidate {
+     }
+ }
+ 
++/// Fork: see `prefill_work`; a cached conversational turn's new tokens rarely exceed this.
++const SHORT_TAIL_TOKENS: usize = 512;
++
+ impl RequestScheduler {
+     pub(super) fn dominates_padding(&self, smaller: Candidate, larger: Candidate) -> bool {
+         let rows = |candidate: Candidate| {
+@@ -276,13 +279,26 @@ impl RequestScheduler {
+ 
+     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
+         let start = request.consumed_tokens as usize;
+-        let mut end = request
+-            .message_boundaries
+-            .get(request.message_boundaries.partition_point(|&n| n <= start))
+-            .copied()
+-            .unwrap_or(request.prompt_tokens)
+-            .min(start.saturating_add(capacity))
+-            .min(request.prefill_limit());
++        let limit = request.prefill_limit();
++        // Short-tail turns (fork, robot latency): when the rest of the prompt is at most
++        // SHORT_TAIL_TOKENS and fits one chunk, prefill it in one step instead of stopping at each
++        // message boundary. Every prefill step reads most routed-expert weights, so a cached
++        // conversational turn otherwise pays one full step per message boundary before its first
++        // token. The final prompt and terminal checkpoints still publish; only intermediate message
++        // checkpoints inside the short tail are skipped (a later divergent re-render recomputes at
++        // most SHORT_TAIL_TOKENS).
++        let tail = request.prompt_tokens.min(limit).saturating_sub(start);
++        let mut end = if tail <= SHORT_TAIL_TOKENS && tail <= capacity {
++            start + tail
++        } else {
++            request
++                .message_boundaries
++                .get(request.message_boundaries.partition_point(|&n| n <= start))
++                .copied()
++                .unwrap_or(request.prompt_tokens)
++                .min(start.saturating_add(capacity))
++                .min(limit)
++        };
+         if let Some(span) = request
+             .prefill_spans
+             .iter()
+-- 
+2.43.0
+

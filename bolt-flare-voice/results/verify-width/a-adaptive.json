@@ -1,0 +1,12 @@
+{
+ "label": "a-adaptive",
+ "voice": {
+  "rounds": 2879.0,
+  "tokens_per_round": 2.1410211879124694,
+  "draft_accept_rate": 0.5402762688188733,
+  "gpu_tok_s": 54.46820583127653,
+  "t1_p50_ms": 84.5,
+  "t5_p50_ms": 169.8,
+  "t8_p50_ms": 228.2
+ }
+}

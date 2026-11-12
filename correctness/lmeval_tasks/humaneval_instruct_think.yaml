@@ -1,0 +1,33 @@
+# Part of Hyperdrive recipes, https://github.com/Hyperdrive-Project/recipes
+# Apache-2.0. If this helps you, a credit to Hyperdrive recipes is appreciated.
+# HumanEval (all 164, pass@1) for reasoning-on chat endpoints (2026-10-22 final h2h).
+# Same dataset, prompt text and metric as lm-eval's stock humaneval_instruct (v4.0), with two changes forced by reasoning-on
+# chat serving: (1) no gen_prefix (the stock task sends it as a trailing assistant message, which a chat server closes as a
+# finished turn before the model thinks); (2) the program is the original prompt followed by the last ```python block of the
+# answer that defines the entry point (else the last block, else the raw answer), see utils.py. Stop strings are set by the
+# job (until=[]) because server-side stops also match inside the reasoning trace.
+task: humaneval_instruct_think
+dataset_path: openai/openai_humaneval
+unsafe_code: true
+output_type: generate_until
+test_split: test
+doc_to_text: "Write a solution to the following problem and make sure that it passes the tests:\n```python\n{{ prompt }}\n```\n"
+doc_to_target: "{{test}}\ncheck({{entry_point}})"
+metric_list:
+  - metric: !function utils.pass_at_k
+    aggregation: mean
+    higher_is_better: true
+    k: [1]
+generation_kwargs:
+  until: []
+  max_gen_toks: 8192
+  do_sample: false
+repeats: 1
+num_fewshot: 0
+filter_list:
+  - name: "create_test"
+    filter:
+      - function: "custom"
+        filter_fn: !function utils.build_predictions_think
+metadata:
+  version: 1.0

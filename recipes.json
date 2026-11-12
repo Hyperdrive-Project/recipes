@@ -1,0 +1,184 @@
+{
+  "schema": "hyperdrive-recipes/1",
+  "repo": "https://github.com/Hyperdrive-Project/recipes",
+  "about": "Tuned serving recipes for open models: engine, kernels, speculative decoding, batching and memory, with a quality gate. Every command runs from the repo root. Every server is OpenAI-compatible.",
+  "notes": [
+    "Recipes download 70-125 GB of weights and hold a whole GPU. Ask the user before setup steps.",
+    "Throughput is output tok/s per GPU at 8K in / 1K out with unique prompts unless the result says otherwise.",
+    "Quality is reasoning-on math / code / tools (GSM8K 50, HumanEval 30, 11 tool calls)."
+  ],
+  "recipes": [
+    {
+      "id": "super-vl-b300-v3",
+      "model": "Nemotron 3.5 Super VL 120B-A12B NVFP4",
+      "hf": "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4@59b8721646c38111a242da18218859fb2b454322",
+      "gpu": [
+        "b300"
+      ],
+      "engine": "TensorRT-LLM 1.4.0rc1 (patched image)",
+      "use_for": "maximum throughput, many users",
+      "result": "7,264 burst / 7,053 sustained output tok/s at 160 users (5.8x the stock B200 recipe; no stock B300 run)",
+      "quality": "49/50, 29/30, 11/11",
+      "weight_change": "Mamba-2 projections re-quantized to NVFP4 (opt-in); use super-vl-b300-v2 for none",
+      "docs": "nemotron-super-vl/README.md",
+      "setup": [
+        "cd nemotron-super-vl && scripts/download_models.sh ./models",
+        "cd nemotron-super-vl && docker build --build-arg NHD_STACK=v3 -t nemotron-hyperdrive:1.4.0rc1-v3 .",
+        "cd nemotron-super-vl && scripts/make_fp4_mamba.sh"
+      ],
+      "serve": "cd nemotron-super-vl && IMAGE=nemotron-hyperdrive:1.4.0rc1-v3 MODEL=super-vl-nvfp4-m4 scripts/serve.sh configs/b300/hyperdrive-b300-v3.yaml configs/b300/hyperdrive-b300-v3.env && scripts/wait_ready.sh",
+      "stop": "cd nemotron-super-vl && scripts/stop.sh",
+      "endpoint": "http://127.0.0.1:8000/v1",
+      "served_model": "nemotron-3.5-super-vl"
+    },
+    {
+      "id": "super-vl-b300-v2",
+      "model": "Nemotron 3.5 Super VL 120B-A12B NVFP4",
+      "hf": "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4@59b8721646c38111a242da18218859fb2b454322",
+      "gpu": [
+        "b300"
+      ],
+      "engine": "TensorRT-LLM 1.4.0rc1 (patched image)",
+      "use_for": "high throughput with no weight changes",
+      "result": "6,752 burst / 6,723 sustained output tok/s at 160 users",
+      "quality": "48/50, 29/30, 11/11",
+      "docs": "nemotron-super-vl/README.md",
+      "setup": [
+        "cd nemotron-super-vl && scripts/download_models.sh ./models",
+        "cd nemotron-super-vl && docker build --build-arg NHD_STACK=v3 -t nemotron-hyperdrive:1.4.0rc1-v3 ."
+      ],
+      "serve": "cd nemotron-super-vl && IMAGE=nemotron-hyperdrive:1.4.0rc1-v3 scripts/serve.sh configs/b300/hyperdrive-b300-v2.yaml configs/b300/hyperdrive-b300-v2.env && scripts/wait_ready.sh",
+      "stop": "cd nemotron-super-vl && scripts/stop.sh",
+      "endpoint": "http://127.0.0.1:8000/v1",
+      "served_model": "nemotron-3.5-super-vl"
+    },
+    {
+      "id": "super-vl-b200-v3",
+      "model": "Nemotron 3.5 Super VL 120B-A12B NVFP4",
+      "hf": "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4@59b8721646c38111a242da18218859fb2b454322",
+      "gpu": [
+        "b200"
+      ],
+      "engine": "TensorRT-LLM 1.4.0rc1 (patched image)",
+      "use_for": "maximum throughput, many users",
+      "result": "6,280 / 6,307 output tok/s at 128 users (5.0x the stock model-card recipe)",
+      "quality": "same weights and kernels passed on B300 (49/50, 29/30, 11/11)",
+      "weight_change": "Mamba-2 projections re-quantized to NVFP4 (opt-in)",
+      "docs": "nemotron-super-vl/README.md",
+      "setup": [
+        "cd nemotron-super-vl && scripts/download_models.sh ./models",
+        "cd nemotron-super-vl && docker build --build-arg NHD_STACK=v3 -t nemotron-hyperdrive:1.4.0rc1-v3 .",
+        "cd nemotron-super-vl && scripts/make_fp4_mamba.sh"
+      ],
+      "serve": "cd nemotron-super-vl && IMAGE=nemotron-hyperdrive:1.4.0rc1-v3 MODEL=super-vl-nvfp4-m4 scripts/serve.sh configs/b200/hyperdrive-b200-v3.yaml configs/b200/hyperdrive-b200-v3.env && scripts/wait_ready.sh",
+      "stop": "cd nemotron-super-vl && scripts/stop.sh",
+      "endpoint": "http://127.0.0.1:8000/v1",
+      "served_model": "nemotron-3.5-super-vl"
+    },
+    {
+      "id": "super-vl-b200-sglang",
+      "model": "Nemotron 3.5 Super VL 120B-A12B NVFP4",
+      "hf": "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4@59b8721646c38111a242da18218859fb2b454322",
+      "gpu": [
+        "b200"
+      ],
+      "engine": "SGLang (stock image, Hyperdrive flags)",
+      "use_for": "an SGLang stack, no custom image; text only",
+      "result": "3,705 output tok/s at 128 users (+58% vs cookbook defaults)",
+      "quality": "48/50, 29/30, 11/11",
+      "docs": "nemotron-super-vl/docs/SGLANG.md",
+      "setup": [
+        "cd nemotron-super-vl && scripts/download_models.sh ./models"
+      ],
+      "serve": "cd nemotron-super-vl && configs/sglang/serve-b200.sh ./models && scripts/wait_ready.sh",
+      "stop": "docker rm -f nhd-sglang",
+      "endpoint": "http://127.0.0.1:8000/v1",
+      "served_model": "nemotron-3.5-super-vl"
+    },
+    {
+      "id": "super-vl-vllm",
+      "model": "Nemotron 3.5 Super VL 120B-A12B NVFP4",
+      "hf": "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4@59b8721646c38111a242da18218859fb2b454322",
+      "gpu": [
+        "b200",
+        "b300"
+      ],
+      "engine": "vLLM 0.32.0 (stock, Hyperdrive flags)",
+      "use_for": "a vLLM stack, no custom image",
+      "result": "B200 5,567 at 128 users, B300 6,470 at 160 users (cache-assisted)",
+      "quality": "49/50, 29/30, 11/11",
+      "docs": "nemotron-super-vl/docs/VLLM.md",
+      "setup": [],
+      "serve": "GPU=<b200|b300> nemotron-super-vl/configs/vllm/serve-hyperdrive.sh   # inside vllm/vllm-openai:v0.32.0 or an env with vLLM 0.32.0",
+      "stop": "Ctrl-C (foreground)",
+      "endpoint": "http://127.0.0.1:8000/v1",
+      "served_model": "nemotron-3.5-super-vl"
+    },
+    {
+      "id": "super-vl-spark",
+      "model": "Nemotron 3.5 Super VL 120B-A12B NVFP4",
+      "hf": "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4@59b8721646c38111a242da18218859fb2b454322",
+      "gpu": [
+        "spark"
+      ],
+      "engine": "TensorRT-LLM 1.4.0rc1 (patched image) + LiLiCorr drafter",
+      "use_for": "Super VL for 1-8 users on a desk machine",
+      "result": "39.0 tok/s at 1 user, 77.8 at 8 users, 1K/1K (1.06-2.13x the stock vLLM recipe)",
+      "quality": "GSM8K 98.8%, HumanEval 98.8% (lm-eval)",
+      "docs": "nemotron-super-vl/README.md",
+      "setup": [
+        "cd nemotron-super-vl && scripts/download_models.sh ./models",
+        "cd nemotron-super-vl && docker build -t nemotron-hyperdrive:1.4.0rc1 ."
+      ],
+      "serve": "cd nemotron-super-vl && scripts/serve.sh configs/spark/hyperdrive-spark.yaml configs/spark/hyperdrive-spark.env && scripts/wait_ready.sh",
+      "stop": "cd nemotron-super-vl && scripts/stop.sh",
+      "endpoint": "http://127.0.0.1:8000/v1",
+      "served_model": "nemotron-3.5-super-vl"
+    },
+    {
+      "id": "bolt-voice-spark",
+      "model": "Nemotron 3.5 Bolt 74B-A9B 24GB",
+      "hf": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB@c6cc2e8f",
+      "gpu": [
+        "spark"
+      ],
+      "engine": "NVIDIA Flare (patched)",
+      "use_for": "real-time voice: lowest time to the first spoken word",
+      "result": "0.084 s to first token, ~0.30 s to first phrase, 60.8 tok/s decode",
+      "quality": "48/50, 27-29/30, 11/11",
+      "docs": "bolt-flare-voice/README.md",
+      "setup": [
+        "see bolt-flare-voice/README.md#run-it: build Flare at the pinned commit, git am the patch series, export the speech package"
+      ],
+      "serve": "FL=~/flare-bolt FX=<dir with flare-config.toml> bolt-flare-voice/serve/serve-bolt.sh",
+      "stop": "Ctrl-C (foreground)",
+      "endpoint": "http://127.0.0.1:8000/v1",
+      "served_model": "bolt",
+      "request_note": "send \"chat_template_kwargs\": {\"enable_thinking\": false} for voice turns"
+    },
+    {
+      "id": "qwen-flash-next-spark",
+      "model": "Qwen3.8 Flash-Next FP4-Local",
+      "hf": "nvidia/Qwen3.8-Flash-Next-FP4-Local@b9ce18a6887e18c089fdea8509a33e63429a3300",
+      "gpu": [
+        "spark"
+      ],
+      "engine": "vLLM (eugr b12x image, pinned) + Hyperdrive overlays + FancyCake 48",
+      "use_for": "a fast local chat and agent model, long context",
+      "result": "SparkBench PBM 49.8 / 25.7 / 16.2 tok/s at 4K / 50K / 100K",
+      "quality": "GSM8K 49/50, HumanEval 28/30, tools 11/11",
+      "docs": "qwen-flash-next/README.md",
+      "setup": [
+        "hf download nvidia/Qwen3.8-Flash-Next-FP4-Local --revision b9ce18a6887e18c089fdea8509a33e63429a3300"
+      ],
+      "serve": "qwen-flash-next/serve.sh",
+      "stop": "docker rm -f hd-qwen",
+      "endpoint": "http://127.0.0.1:8000/v1",
+      "served_model": "qwen3.8-flash-next"
+    }
+  ],
+  "checks": {
+    "quality": "python3 correctness/eval.py --label mine --tasks math,code,tools --reasoning on",
+    "throughput": "nemotron-super-vl/scripts/aiperf_sweep.sh 8192 1024 \"1 8 32 64 128\""
+  }
+}

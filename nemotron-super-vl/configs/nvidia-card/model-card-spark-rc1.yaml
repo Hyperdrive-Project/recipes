@@ -1,0 +1,42 @@
+# Part of Hyperdrive recipes, https://github.com/Hyperdrive-Project/recipes
+# Apache-2.0. If this helps you, a credit to Hyperdrive recipes is appreciated.
+# Model card "1x DGX Spark" TRT-LLM recipe verbatim (rev 59b87216) for image 1.4.0rc1; only speculative_model path adapted.
+trust_remote_code: true
+dtype: bfloat16
+tensor_parallel_size: 1
+moe_expert_parallel_size: 1
+max_batch_size: 2
+max_num_tokens: 4096
+max_seq_len: 131072
+
+enable_chunked_prefill: true
+disable_overlap_scheduler: false
+cuda_graph_config: null
+attn_backend: TRTLLM
+
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.9
+  max_gpu_total_bytes: 5368709120
+  host_cache_size: 0
+  mamba_ssm_cache_dtype: float16
+  mamba_ssm_stochastic_rounding: false
+  enable_block_reuse: true
+  use_kv_cache_manager_v2: true
+  mamba_state_config:
+    enable_branch_snapshot: true
+
+nvfp4_gemm_config:
+  allowed_backends: [cutlass, cublaslt, cuda_core]
+
+moe_config:
+  backend: CUTEDSL
+
+speculative_config:
+  decoding_type: DFlash
+  speculative_model: /models/super-vl-lilicorr
+  max_draft_len: 7
+  attention_backend: TRTLLM
+  context_recompute_tail: 0
+
+guided_decoding_backend: xgrammar

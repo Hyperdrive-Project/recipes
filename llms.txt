@@ -1,0 +1,20 @@
+# Hyperdrive recipes
+
+> Tuned, reproducible serving recipes for open models on NVIDIA GPUs (B300, B200, DGX Spark) with TensorRT-LLM, vLLM, SGLang and NVIDIA Flare. Each recipe is one model on one machine, with configs, patches, a one-command launcher, a benchmark protocol and a quality gate. Apache-2.0.
+
+Start here as an agent:
+
+- `./hyperdrive detect` finds the GPU and lists matching recipes. `./hyperdrive show <id>` prints the exact setup, serve, stop and check commands. `./hyperdrive run <id> --yes` runs them. Add `--json` for machine-readable output. Python standard library only.
+- [recipes.json](recipes.json): the machine-readable catalog (model and revision, GPU, engine, commands, endpoint, served model name, measured result, quality).
+- [AGENTS.md](AGENTS.md): ground rules (ask before downloading or taking a GPU, keep quality, measure with unique prompts).
+
+## Recipes
+
+- [Nemotron 3.5 Super VL on B300 / B200 / DGX Spark](nemotron-super-vl/README.md): TensorRT-LLM (patched image), SGLang and vLLM. B300 7,264 output tok/s per GPU (5.8x the stock B200 recipe); B200 5.0x the stock model-card recipe; Spark up to 2.13x the stock vLLM recipe.
+- [Nemotron 3.5 Bolt on DGX Spark for real-time voice](bolt-flare-voice/README.md): NVIDIA Flare. 0.084 s to first token.
+- [Qwen3.8 Flash-Next FP4-Local on DGX Spark](qwen-flash-next/README.md): vLLM. SparkBench PBM 49.8 / 25.7 / 16.2 tok/s at 4K / 50K / 100K.
+
+## Checks
+
+- [Quality suite](correctness/README.md): `python3 correctness/eval.py --tasks math,code,tools --reasoning on` against any OpenAI-compatible server.
+- [All results with dates and protocols](RECIPES.md)

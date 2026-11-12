@@ -1,0 +1,49 @@
+# Part of Hyperdrive recipes, https://github.com/Hyperdrive-Project/recipes
+# Apache-2.0. If this helps you, a credit to Hyperdrive recipes is appreciated.
+# BEST step 4 (2026-10-22): v3a + batch 4 + stream_interval 4 + tool-json fix + text-only breakable prefill CUDA graphs.
+stream_interval: 4
+prefill_cuda_graph_backend: breakable
+# (the chat template renders the previous generation prompt '<think>\n' as '<think></think>' in the next turn, so turns diverge
+# exactly 1 token before the earlier prompt's end; see experiments/sparkbench/divergence.py).
+trust_remote_code: true
+dtype: bfloat16
+tensor_parallel_size: 1
+moe_expert_parallel_size: 1
+max_batch_size: 4
+max_num_tokens: 8192
+max_seq_len: 131072
+
+enable_chunked_prefill: true
+disable_overlap_scheduler: false
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [1, 2, 3, 4]
+attn_backend: TRTLLM
+
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.9
+  max_gpu_total_bytes: 5368709120
+  host_cache_size: 0
+  mamba_ssm_cache_dtype: float16
+  mamba_ssm_stochastic_rounding: false
+  enable_block_reuse: true
+  use_kv_cache_manager_v2: true
+  mamba_state_config:
+    enable_branch_snapshot: true
+    additional_snapshot_offsets_from_end: [1, 576]
+
+nvfp4_gemm_config:
+  allowed_backends: [cutlass, cublaslt, cuda_core]
+
+moe_config:
+  backend: CUTLASS
+
+speculative_config:
+  decoding_type: DFlash
+  speculative_model: /models/super-vl-lilicorr
+  max_draft_len: 7
+  attention_backend: VANILLA  # card: TRTLLM; rc1 raises "requires SM100 or SM103, got SM121" for LiLiCorrForCausalLM
+  context_recompute_tail: 0
+
+guided_decoding_backend: xgrammar

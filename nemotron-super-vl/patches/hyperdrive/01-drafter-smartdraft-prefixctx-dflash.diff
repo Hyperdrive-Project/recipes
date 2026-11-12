@@ -1,0 +1,819 @@
+--- a/tensorrt_llm/_torch/speculative/dflash.py	2026-10-23 02:02:46.054695380 +0000
++++ b/tensorrt_llm/_torch/speculative/dflash.py	2026-10-23 02:02:46.059294286 +0000
+@@ -13,11 +13,14 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import json  # NHD adaptk
+ import os
+-from collections import deque
++import time  # NHD adaptk
++from collections import OrderedDict, deque  # NHD ctx-carry: OrderedDict
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Callable, List, Optional
+ 
++import numpy as np  # NHD ctx-carry
+ import torch
+ from torch import nn
+ 
+@@ -37,6 +40,17 @@
+     validate_dflash_trtllm_gen_runtime,
+ )
+ from .interface import SpecMetadata, SpecWorkerBase
++from .sa_enhancer import SADraftEnhancer  # NHD: SA on DFlash
++
++# --- NHD adaptive verify length (dflash-adaptk; opt-in) -------------------------------------------------------------
++# NHD_ADAPTK=1: per-step verify length from drafter confidence (rows past it are routed like the last verified row in
++# modeling_nemotron_h.py and their drafts are force-rejected here). NHD_ADAPTK_TRACE=1: per-step acceptance/confidence
++# trace. Both unset: every NHD adaptk branch below is skipped.
++_NHD_ADAPTK = os.environ.get("NHD_ADAPTK", "0") == "1"
++_NHD_ADAPTK_TRACE = os.environ.get("NHD_ADAPTK_TRACE", "0") == "1"
++_NHD_ADAPTK_CTL = os.environ.get("NHD_ADAPTK_CTL", "")
++_NHD_ADAPTK_OUT = os.environ.get("NHD_ADAPTK_OUT", "/run-out/adaptk_trace.jsonl")
++_NHD_RING = 1 << 15
+ 
+ # Backends that keep the draft's private context K/V in a paged HND pool.
+ # They share the pool layout, page table and paged append op
+@@ -519,6 +533,177 @@
+     return (block_counts * page_size - block_size).clamp(min=0)
+ 
+ 
++# NHD dflash-ctx-carry ---------------------------------------------------------------------------------------------
++# On SM121 the LiLiCorr drafter runs VANILLA attention over a dense private context arena (one slot per request,
++# reuse_addressable=False). When block reuse lets the target skip a cached prompt prefix, stock DFlash starts the new
++# request's slot empty and the drafter sees only the uncached tail, so acceptance drops on follow-up turns. The arena
++# slot of the request that produced that prefix still holds the drafter K/V for it (eviction only zeroes _ctx_len).
++# With NHD_DFLASH_CTX_CARRY=1 the worker keeps a finished request's slot contents ("retired" slot, LRU) and hands the
++# slot to a later request whose prompt tokens [0, first_pos) equal the retired request's, resuming at first_pos.
++# No new GPU memory, no extra target compute. Drafts only steer verification, so outputs are unchanged.
++class DFlashCtxCarryManager(BaseResourceManager):
++    """Spec resource manager that records prompt tokens per request for DFlashWorker's ctx carry-over.
++
++    Holds no GPU memory. Wraps an optional SuffixAutomatonManager (``sa_manager``; the SA lookups in this file and in
++    the decoder runner already accept a wrapper through that attribute) and forwards every hook to it.
++    """
++
++    def __init__(self, max_num_requests: int, sa_manager=None):
++        self.max_num_requests = max_num_requests
++        self.sa_manager = sa_manager
++        # request id -> (prompt tokens as int32 ndarray, multimodal signature or None)
++        self.prompt_tokens = {}
++
++    @staticmethod
++    def _rid(req):
++        rid = getattr(req, "py_request_id", None)
++        return req.request_id if rid is None else rid
++
++    @staticmethod
++    def _mm_signature(req):
++        try:
++            h = getattr(req, "multimodal_hashes", None)
++            pos = getattr(req, "multimodal_positions", None)
++            if not h and getattr(req, "py_multimodal_data", None) is None:
++                return None
++            return repr((h, pos, sorted((getattr(req, "py_multimodal_data", None) or {}).keys())))
++        except Exception:  # unknown binding shape: refuse to carry rather than guess
++            return "<unknown>"
++
++    def prepare_resources(self, scheduled_batch):
++        if self.sa_manager is not None:
++            self.sa_manager.prepare_resources(scheduled_batch)
++        for req in scheduled_batch.context_requests:
++            if getattr(req, "is_dummy", False) or getattr(req, "is_generation_only_request", False):
++                continue
++            rid = self._rid(req)
++            if rid in self.prompt_tokens:
++                continue
++            self.prompt_tokens[rid] = (np.asarray(req.get_tokens(0), dtype=np.int32), self._mm_signature(req))
++
++    def update_resources(self, scheduled_batch):
++        if self.sa_manager is not None:
++            self.sa_manager.update_resources(scheduled_batch)
++
++    def free_resources(self, request):
++        if self.sa_manager is not None:
++            self.sa_manager.free_resources(request)
++        self.prompt_tokens.pop(self._rid(request), None)
++
++    def add_dummy_requests(self, request_ids):
++        if self.sa_manager is not None:
++            self.sa_manager.add_dummy_requests(request_ids)
++
++    def shutdown(self):
++        if self.sa_manager is not None:
++            self.sa_manager.shutdown()
++        self.prompt_tokens.clear()
++
++    def get_max_resource_count(self) -> int:
++        return self.max_num_requests
++
++    def get_needed_resource_to_completion(self, request) -> int:
++        return 0
++
++
++def _nhd_carry_manager(spec_metadata):
++    rm = getattr(spec_metadata, "spec_resource_manager", None)
++    return rm if isinstance(rm, DFlashCtxCarryManager) else None
++# ------------------------------------------------------------------------------------------------- NHD dflash-ctx-carry
++
++
++# NHD dflash-prefix-ctx -------------------------------------------------------------------------------------------
++class DFlashPrefixCtxTracker(BaseResourceManager):
++    """Spec resource manager recording each request's tokens for DFlashWorker's prefix-keyed drafter context.
++
++    Holds no GPU memory. ``info[rid] = [prompt_tokens (int32 ndarray), mm_signature, final_tokens or None]``.
++    Final tokens (prompt + generated) are recorded when the request is freed; finished entries are kept LRU-capped.
++    Wraps an optional SuffixAutomatonManager (``sa_manager``) and forwards every hook to it.
++    """
++
++    _FINISHED_CAP = 64
++
++    def __init__(self, max_num_requests: int, sa_manager=None):
++        self.max_num_requests = max_num_requests
++        self.sa_manager = sa_manager
++        self.info = {}
++        self.finished = OrderedDict()
++
++    @staticmethod
++    def _rid(req):
++        rid = getattr(req, "py_request_id", None)
++        return req.request_id if rid is None else rid
++
++    @staticmethod
++    def _mm_signature(req):
++        try:
++            h = getattr(req, "multimodal_hashes", None)
++            pos = getattr(req, "multimodal_positions", None)
++            if not h and getattr(req, "py_multimodal_data", None) is None:
++                return None
++            return repr((h, pos, sorted((getattr(req, "py_multimodal_data", None) or {}).keys())))
++        except Exception:  # unknown binding shape: never match anything
++            return object()
++
++    def prepare_resources(self, scheduled_batch):
++        if self.sa_manager is not None:
++            self.sa_manager.prepare_resources(scheduled_batch)
++        for req in scheduled_batch.context_requests:
++            if getattr(req, "is_dummy", False) or getattr(req, "is_generation_only_request", False):
++                continue
++            rid = self._rid(req)
++            if rid in self.info:
++                continue
++            try:
++                toks = np.asarray(req.get_tokens(0), dtype=np.int32)
++            except Exception:
++                continue
++            self.info[rid] = [toks, self._mm_signature(req), None]
++
++    def update_resources(self, scheduled_batch):
++        if self.sa_manager is not None:
++            self.sa_manager.update_resources(scheduled_batch)
++
++    def free_resources(self, request):
++        if self.sa_manager is not None:
++            self.sa_manager.free_resources(request)
++        rid = self._rid(request)
++        ent = self.info.get(rid)
++        if ent is None:
++            return
++        try:
++            ent[2] = np.asarray(request.get_tokens(0), dtype=np.int32)
++        except Exception:
++            ent[2] = None
++        self.finished[rid] = True
++        self.finished.move_to_end(rid)
++        while len(self.finished) > self._FINISHED_CAP:
++            old, _ = self.finished.popitem(last=False)
++            self.info.pop(old, None)
++
++    def add_dummy_requests(self, request_ids):
++        if self.sa_manager is not None:
++            self.sa_manager.add_dummy_requests(request_ids)
++
++    def shutdown(self):
++        if self.sa_manager is not None:
++            self.sa_manager.shutdown()
++        self.info.clear()
++        self.finished.clear()
++
++    def get_max_resource_count(self) -> int:
++        return self.max_num_requests
++
++    def get_needed_resource_to_completion(self, request) -> int:
++        return 0
++
++
++def _nhd_pc_tracker(spec_metadata):
++    rm = getattr(spec_metadata, "spec_resource_manager", None)
++    return rm if isinstance(rm, DFlashPrefixCtxTracker) else None
++# ------------------------------------------------------------------------------------------------ NHD dflash-prefix-ctx
++
++
+ @dataclass
+ class DFlashSpecMetadata(SpecMetadata):
+     """Metadata for DFlash speculative decoding.
+@@ -580,6 +765,17 @@
+             self._capture_layer_set = frozenset()
+             self._layer_to_idx = {}
+ 
++    def _get_sa_manager(self):
++        """NHD: the SuffixAutomatonManager when DFlash runs with sa_config, else None."""
++        from .suffix_automaton import SuffixAutomatonManager
++
++        rm = self.spec_resource_manager
++        if rm is None:
++            return None
++        if isinstance(rm, SuffixAutomatonManager):
++            return rm
++        return getattr(rm, "sa_manager", None)
++
+     def prepare(self):
+         assert self.request_ids is not None
+ 
+@@ -589,17 +785,29 @@
+         )
+         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
+ 
++        # NHD: map generation requests to their suffix-automaton slots (outside the CUDA graph).
++        sa_manager = self._get_sa_manager()
++        if sa_manager is not None:
++            gen_request_ids = self.request_ids[num_seqs - self.num_generations :]
++            if gen_request_ids:
++                sa_manager.prepare(gen_request_ids, self.runtime_draft_len)
++
+         # Update slot mapping for DFlash context buffers
+         worker = getattr(self, "_dflash_worker", None)
+         if worker is not None and worker._ctx_buf_inited:
+             current = set(self.request_ids)
+             evicted = {}
++            carry = _nhd_carry_manager(self) is not None  # NHD ctx-carry
+             for rid in list(worker._req_to_slot.keys()):
+                 if rid not in current:
+                     slot = worker._req_to_slot.pop(rid)
+                     evicted[slot] = 0
+-                    worker._req_ctx_pos.pop(rid, None)
++                    stored = worker._req_ctx_pos.pop(rid, None)
+                     worker._free_slots.append(slot)
++                    if carry:
++                        worker._nhd_retire(slot, stored)
++            if evicted and _nhd_pc_tracker(self) is not None:  # NHD prefix-ctx: keep finished contexts
++                worker._pc_retire(list(evicted.keys()))
+             worker._write_ctx_len(evicted)
+ 
+             # A disagg generation worker receives prompt KV instead of
+@@ -629,6 +837,8 @@
+                 pin_memory=prefer_pinned(),
+             )
+             worker._batch_to_slot[:num_seqs].copy_(mapping, non_blocking=True)
++            if worker._nhd_vlen is not None:  # NHD adaptk
++                worker._nhd_host_tick()
+ 
+     def is_layer_capture(self, layer_id: int) -> bool:
+         return layer_id in self._capture_layer_set
+@@ -706,6 +916,10 @@
+         super().__init__(use_separate_draft_kv_cache)
+         self.spec_config = spec_config
+         self.mapping = mapping
++        # NHD: optional suffix-automaton enhancer (sa_config on DFlashDecodingConfig).
++        self.sa_enhancer: Optional[SADraftEnhancer] = None
++        if getattr(spec_config, "sa_config", None) is not None:
++            self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
+         self._resolved_mask_token_id = None
+         self._resolved_block_size = None
+         self._compute_block_size = None
+@@ -731,6 +945,9 @@
+         self._kv_rewind_nc = None
+         self._kv_rewind_bs = None
+         self._batch_to_slot = None
++        self._nhd_vlen = None  # NHD adaptk
++        self._nhd_ring = None
++        self._nhd_vl_used = None
+         self._max_ctx = 0
+         self._ctx_k_buf = None  # [max_batch+1, L, max_ctx+block, nkv, hd]
+         self._ctx_v_buf = None
+@@ -769,6 +986,18 @@
+         self._free_slots = deque()  # available slot indices
+         self._dummy_slot = None  # for cudagraph padding or warmup dummy requests
+         self._graph_dummy_id_floor = 1 << 62
++        # NHD ctx-carry: per-slot prompt tokens (+ mm signature) when the slot's numbering is absolute (it was filled
++        # from position 0, or carried); retired slots (free, contents kept) -> (tokens, mm_sig, stored_len), LRU first.
++        self._nhd_slot_tokens = []
++        self._nhd_retired = OrderedDict()
++        self._nhd_carry_hits = 0
++        self._nhd_carry_misses = 0
++        # NHD prefix-ctx (see dflash-prefix-ctx): slot owners with absolute numbering, kept slots, drafter window
++        self._pc_slot_owner = []
++        self._pc_retired = OrderedDict()
++        self._pc_window = None
++        self._pc_hits = 0
++        self._pc_misses = 0
+ 
+         # Opt-in acceptance-statistics recorder (None unless
+         # TLLM_DFLASH_ACCEPT_STATS_DIR is set; see accept_stats.py). Only
+@@ -1115,10 +1344,15 @@
+         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+         self._ctx_len_host = [0] * num_slots
+         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
++        self._nhd_init_adaptk(num_slots, max_batch)  # NHD adaptk
+ 
+         self._free_slots = deque(range(max_batch))
+         self._req_to_slot = {}
+         self._req_ctx_pos = {}
++        self._nhd_slot_tokens = [None] * num_slots  # NHD ctx-carry
++        self._nhd_retired = OrderedDict()
++        self._pc_slot_owner = [None] * num_slots  # NHD prefix-ctx
++        self._pc_retired = OrderedDict()
+ 
+         # checkpoint's trained block width
+         self._resolved_block_size = getattr(draft_model, "block_size", None) or (
+@@ -1142,6 +1376,14 @@
+         draft_model._build_fused_kv_buffers()
+         L = draft_model._num_attn_layers
+         nh = draft_model._num_heads
++        # NHD prefix-ctx: widest left attention window of the drafter's block decode (None = unwindowed)
++        try:
++            lefts = [draft_model._resolve_block_attention(i)[1][0] for i in range(L)]
++            self._pc_window = None if any(w < 0 for w in lefts) else max(lefts) + 1
++        except Exception:
++            self._pc_window = None
++        if os.environ.get("NHD_DFLASH_PREFIX_CTX", "0") == "1":
++            logger.info(f"DFlash prefix-ctx: drafter attention window {self._pc_window} (carry copies that + 64 columns)")
+         nkv = draft_model._num_kv_heads
+         hd = draft_model._head_dim
+         kv_factor = getattr(draft_model, "_kv_factor", 2)
+@@ -1286,6 +1528,15 @@
+         return table.flatten().contiguous(), indptr
+ 
+     def _assign_slot(self, req_id: int, reset: bool = False, updates: Optional[dict] = None):
++        # NHD adaptk: wrapper; a (re)assigned slot gets a new epoch so the trace can split requests.
++        before = self._req_to_slot.get(req_id)
++        slot = self._nhd_assign_slot_impl(req_id, reset=reset, updates=updates)
++        if slot is not None and self._nhd_vlen is not None and (reset or before != slot):
++            self._nhd_epoch_host[slot] += 1
++            self._nhd_epoch[slot] = float(self._nhd_epoch_host[slot])
++        return slot
++
++    def _nhd_assign_slot_impl(self, req_id: int, reset: bool = False, updates: Optional[dict] = None):
+         """Get (or refresh) this request's context slot; None when none is free.
+ 
+         ``reset`` recycles an existing slot, which is how a reused request id is
+@@ -1304,14 +1555,204 @@
+             old_slot = self._req_to_slot.pop(req_id)
+             clear(old_slot)
+             self._free_slots.append(old_slot)
++            self._nhd_forget(old_slot)
++            self._pc_forget(old_slot)  # NHD prefix-ctx
+         if req_id not in self._req_to_slot:
+             if not self._free_slots:
+                 return None
+-            slot = self._free_slots.popleft()
++            slot = self._pc_pop_free_slot()  # NHD prefix-ctx (popleft when nothing is kept)
++            self._nhd_forget(slot)
+             self._req_to_slot[req_id] = slot
+             clear(slot)
+         return self._req_to_slot[req_id]
+ 
++    # NHD prefix-ctx helpers. Invariant: every retired slot is also in _free_slots (retired = free + contents kept).
++    def _pc_forget(self, slot: int) -> None:
++        self._pc_retired.pop(slot, None)
++        if slot < len(self._pc_slot_owner):
++            self._pc_slot_owner[slot] = None
++
++    def _pc_pop_free_slot(self) -> int:
++        """Pop a free slot: one holding no kept context first, else the least recently retired."""
++        if not self._pc_retired:
++            slot = self._free_slots.popleft()  # stock behaviour when nothing is kept
++        else:
++            slot = next((x for x in self._free_slots if x not in self._pc_retired), None)
++            if slot is None:
++                slot = next(iter(self._pc_retired))
++            self._free_slots.remove(slot)
++        self._pc_forget(slot)
++        return slot
++
++    def _pc_retire(self, slots) -> None:
++        """Keep the contents of freed slots whose numbering is absolute. Snapshots their device _ctx_len (async D2H,
++        stream-ordered after every write to them) before the caller zeroes it."""
++        keep = [s for s in slots if s < len(self._pc_slot_owner) and self._pc_slot_owner[s] is not None]
++        for s in slots:
++            if s not in keep:
++                self._pc_forget(s)
++        if not keep or torch.cuda.is_current_stream_capturing():
++            for s in keep:
++                self._pc_forget(s)
++            return
++        idx = torch.tensor(keep, dtype=torch.long, pin_memory=prefer_pinned()).to("cuda", non_blocking=True)
++        host = torch.empty(len(keep), dtype=torch.long, pin_memory=prefer_pinned())
++        host.copy_(self._ctx_len.index_select(0, idx), non_blocking=True)
++        ev = torch.cuda.Event()
++        ev.record()
++        for i, s in enumerate(keep):
++            rid = self._pc_slot_owner[s]
++            self._pc_slot_owner[s] = None
++            self._pc_retired.pop(s, None)
++            self._pc_retired[s] = (rid, host, i, ev)
++
++    def _pc_candidates(self, tracker, req_id: int):
++        """(slot, kept?, tokens, mm_sig, valid columns), retired slots most recent first, then live slots."""
++        for slot, (rid, host, i, ev) in reversed(list(self._pc_retired.items())):
++            ent = tracker.info.get(rid)
++            if ent is None:
++                continue
++            toks = ent[2] if ent[2] is not None else ent[0]
++            ev.synchronize()
++            valid = min(int(host[i]), len(toks), self._max_ctx)
++            yield slot, True, toks, ent[1], valid
++        for rid, slot in list(self._req_to_slot.items()):
++            if rid == req_id or slot >= len(self._pc_slot_owner) or self._pc_slot_owner[slot] != rid:
++                continue
++            ent = tracker.info.get(rid)
++            if ent is None:
++                continue
++            valid = min(len(ent[0]), int(self._req_ctx_pos.get(rid, 0)), self._max_ctx)
++            yield slot, False, ent[0], ent[1], valid
++
++    def _pc_try_carry(self, tracker, req_id: int, first_pos: int, updates: dict) -> bool:
++        """Give ``req_id`` (target prefill starting at ``first_pos`` > 0 after a prefix-cache hit) a slot holding the
++        drafter context of its tokens [0, first_pos). True when it did; the caller then stores from first_pos."""
++        ent = tracker.info.get(req_id)
++        if ent is None or len(ent[0]) < first_pos or first_pos >= self._max_ctx:
++            self._pc_misses += 1
++            logger.info(f"DFlash prefix-ctx: request {req_id} reuses {first_pos} cached tokens; no prompt record")
++            return False
++        prefix = ent[0][:first_pos]
++        best = None
++        for slot, kept, toks, sig, valid in self._pc_candidates(tracker, req_id):
++            if valid >= first_pos and sig == ent[1] and np.array_equal(toks[:first_pos], prefix):
++                best = (slot, kept)
++                break
++        if best is None:
++            self._pc_misses += 1
++            logger.info(
++                f"DFlash prefix-ctx: request {req_id} reuses {first_pos} cached tokens, no slot holds that prefix "
++                f"({len(self._pc_retired)} kept); drafter starts from the tail (hits {self._pc_hits}, misses "
++                f"{self._pc_misses})")
++            return False
++        src, src_kept = best
++        if req_id in self._req_to_slot:  # restarted prefill: drop its old slot like _assign_slot(reset=True)
++            old = self._req_to_slot.pop(req_id)
++            updates[old] = 0
++            self._free_slots.append(old)
++            self._pc_forget(old)
++        dst = next((s for s in self._free_slots if s not in self._pc_retired), None)
++        if dst is None:
++            dst = next((s for s in self._pc_retired if s != src), None)  # least recently retired first
++        if dst is None:
++            if not src_kept:
++                self._pc_misses += 1
++                logger.info(f"DFlash prefix-ctx: request {req_id}: no free slot to copy into")
++                return False
++            dst = src
++        self._free_slots.remove(dst)
++        copied = 0
++        if dst != src:
++            lo = 0 if self._pc_window is None else max(0, first_pos - self._pc_window - 64)
++            self._ctx_k_buf[dst, :, lo:first_pos].copy_(self._ctx_k_buf[src, :, lo:first_pos])
++            if self._ctx_v_buf is not None:
++                self._ctx_v_buf[dst, :, lo:first_pos].copy_(self._ctx_v_buf[src, :, lo:first_pos])
++            copied = first_pos - lo
++        self._pc_forget(dst)
++        self._req_to_slot[req_id] = dst
++        self._pc_slot_owner[dst] = req_id
++        updates[dst] = first_pos
++        if getattr(self, "_nhd_vlen", None) is not None:  # NHD adaptk: new epoch, as _assign_slot does
++            self._nhd_epoch_host[dst] += 1
++            self._nhd_epoch[dst] = float(self._nhd_epoch_host[dst])
++        self._pc_hits += 1
++        logger.info(
++            f"DFlash prefix-ctx: request {req_id} resumes at {first_pos} from {'kept' if src_kept else 'live'} slot "
++            f"{src} -> slot {dst} ({copied} columns copied; hits {self._pc_hits}, misses {self._pc_misses})")
++        return True
++
++    # NHD ctx-carry helpers. Invariant: every retired slot is also in _free_slots (retired = free + contents kept).
++    def _nhd_forget(self, slot: int) -> None:
++        self._nhd_retired.pop(slot, None)
++        if slot < len(self._nhd_slot_tokens):
++            self._nhd_slot_tokens[slot] = None
++
++    def _nhd_pop_free_slot(self) -> int:
++        """Pop a free slot: one holding no kept context first, else the least recently retired."""
++        if not self._nhd_retired:
++            slot = self._free_slots.popleft()  # stock behaviour when nothing is retained
++        else:
++            slot = next((x for x in self._free_slots if x not in self._nhd_retired), None)
++            if slot is None:
++                slot = next(iter(self._nhd_retired))
++            self._free_slots.remove(slot)
++        self._nhd_forget(slot)
++        return slot
++
++    def _nhd_retire(self, slot: int, stored: Optional[int]) -> None:
++        """Keep a freed slot's context if its numbering is absolute: positions [0, stored) hold the drafter K/V of
++        the prompt tokens recorded for it. Called on eviction (request left the batch)."""
++        rec = self._nhd_slot_tokens[slot] if slot < len(self._nhd_slot_tokens) else None
++        if rec is None or not stored or stored <= 0:
++            self._nhd_forget(slot)
++            return
++        tokens, mm_sig = rec
++        valid = min(int(stored), len(tokens))
++        self._nhd_retired[slot] = (tokens, mm_sig, valid)
++        self._nhd_retired.move_to_end(slot)
++
++    def _nhd_try_carry(self, tracker, req_id: int, first_pos: int, updates: dict) -> bool:
++        """Give ``req_id`` (whose target prefill starts at ``first_pos`` > 0 after a prefix-cache hit) a retired slot
++        that already holds the drafter context for its tokens [0, first_pos). True when it did."""
++        if first_pos <= 0 or self._ctx_reuse_addressable or self._ctx_block_tables is not None:
++            return False
++        rec = tracker.prompt_tokens.get(req_id)
++        if rec is None:
++            return False
++        new_tokens, new_sig = rec
++        if not self._nhd_retired or len(new_tokens) < first_pos:
++            self._nhd_carry_misses += 1
++            logger.info(f"DFlash ctx-carry: request {req_id} reuses {first_pos} cached tokens, no retained slot "
++                        f"({len(self._nhd_retired)} retained); drafter starts from the tail")
++            return False
++        best = None
++        for slot, (tokens, mm_sig, valid) in reversed(self._nhd_retired.items()):  # most recent first
++            if valid < first_pos or mm_sig != new_sig:
++                continue
++            if np.array_equal(tokens[:first_pos], new_tokens[:first_pos]):
++                best = slot
++                break
++        if best is None:
++            self._nhd_carry_misses += 1
++            logger.info(f"DFlash ctx-carry: request {req_id} reuses {first_pos} cached tokens, no retained slot "
++                        f"matches ({len(self._nhd_retired)} retained); drafter starts from the tail")
++            return False
++        if req_id in self._req_to_slot:  # restarted prefill: drop the old slot like _assign_slot(reset=True)
++            old = self._req_to_slot.pop(req_id)
++            updates[old] = 0
++            self._free_slots.append(old)
++            self._nhd_forget(old)
++        del self._nhd_retired[best]
++        self._free_slots.remove(best)
++        self._req_to_slot[req_id] = best
++        self._nhd_slot_tokens[best] = rec
++        updates[best] = first_pos
++        self._nhd_carry_hits += 1
++        logger.info(f"DFlash ctx-carry: request {req_id} resumes slot {best} at {first_pos} "
++                    f"(hits {self._nhd_carry_hits}, misses {self._nhd_carry_misses})")
++        return True
++
+     def _get_ctx_paged_append(self) -> Callable[..., None]:
+         """flashinfer paged append, shared by the TRTLLM and FA4 backends."""
+         if self._ctx_paged_append is None:
+@@ -1480,6 +1921,9 @@
+         # the same values, but reading it costs a D2H sync per request.
+         host_pos = spec_metadata.host_position_ids
+         ctx_len_updates = {}
++        tracker = _nhd_carry_manager(spec_metadata)  # NHD ctx-carry (None unless NHD_DFLASH_CTX_CARRY=1)
++        # NHD prefix-ctx (None unless NHD_DFLASH_PREFIX_CTX=1); only the dense VANILLA arena is handled.
++        pc_tracker = _nhd_pc_tracker(spec_metadata) if not self._ctx_paged else None
+         offset = 0
+         num_contexts = attn_metadata.num_contexts
+         # A context write addresses pages through row i of the block table, so
+@@ -1509,7 +1953,18 @@
+             # request id reused after completion, a prefill restarted after
+             # preemption -- has to start from a clean slot.
+             reset = self._req_ctx_pos.get(req_id) != first_pos
+-            if self._assign_slot(req_id, reset=reset, updates=ctx_len_updates) is None:
++            # NHD ctx-carry: a fresh request that starts past a cached prefix may resume a retained slot.
++            carried = (
++                tracker is not None
++                and reset
++                and self._nhd_try_carry(tracker, req_id, first_pos, ctx_len_updates)
++            ) or (  # NHD prefix-ctx
++                pc_tracker is not None
++                and reset
++                and first_pos > 0
++                and self._pc_try_carry(pc_tracker, req_id, first_pos, ctx_len_updates)
++            )
++            if not carried and self._assign_slot(req_id, reset=reset, updates=ctx_len_updates) is None:
+                 logger.warning("DFlash: no free slots, skipping context store")
+                 self._req_ctx_pos.pop(req_id, None)
+                 offset += slen
+@@ -1517,6 +1972,13 @@
+ 
+             slot = self._req_to_slot[req_id]
+             cur = ctx_len_updates.get(slot, self._ctx_len_host[slot])
++            if carried:
++                cur = first_pos
++            elif tracker is not None and reset:
++                # Positions are slot-local; they equal absolute positions only when the slot starts at 0.
++                self._nhd_slot_tokens[slot] = tracker.prompt_tokens.get(req_id) if first_pos == 0 else None
++            if pc_tracker is not None and reset:  # NHD prefix-ctx: absolute numbering only from 0 or carried
++                self._pc_slot_owner[slot] = req_id if (carried or first_pos == 0) else None
+             cap = self._max_ctx if ctx_alloc is None else min(self._max_ctx, ctx_alloc[i])
+             if cur == 0 and first_pos > 0 and self._ctx_reuse_addressable:
+                 # Reuse let the target skip [0, first_pos), so only the tail
+@@ -1536,6 +1998,8 @@
+                 self._req_ctx_pos.pop(req_id, None)
+                 ctx_len_updates[slot] = 0
+                 self._free_slots.append(slot)
++                self._nhd_forget(slot)  # NHD ctx-carry
++                self._pc_forget(slot)  # NHD prefix-ctx
+                 offset += slen
+                 continue
+             end = cur + slen
+@@ -1689,6 +2153,19 @@
+                 state_indices=attn_metadata.mamba_metadata.state_indices,
+             )
+ 
++        # NHD: extend SA states with the accepted tokens on a side stream; overlaps the draft forward.
++        sa_manager = spec_metadata._get_sa_manager() if self.sa_enhancer is not None else None
++        if sa_manager is not None:
++            self.sa_enhancer.extend_and_prepare(
++                sa_manager=sa_manager,
++                request_ids=spec_metadata.request_ids,
++                accepted_tokens=accepted_tokens,
++                num_accepted_tokens=num_accepted_tokens,
++                num_gens=num_gens,
++                num_contexts=num_contexts,
++                max_draft_len=K,
++            )
++
+         self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
+         self._prepare_kv_for_draft_forward(
+             attn_metadata, num_accepted_tokens, num_contexts, batch_size
+@@ -1800,6 +2277,16 @@
+                     num_contexts=num_contexts,
+                 )
+ 
++                # NHD: SA drafts replace neural drafts where the suffix match >= threshold.
++                if sa_manager is not None:
++                    gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
++                        gen_draft_tokens
++                    )
++
++                # NHD adaptk: next verify length from this block's confidence; trace row.
++                if self._nhd_vlen is not None:
++                    self._nhd_after_draft(gen_logits, num_contexts, num_gens, num_accepted_tokens)
++
+                 # Opt-in confidence-calibration recording (env-gated). The
+                 # confidence values come from an optional provider on the
+                 # recorder (None here -> no calibration rows collected; the
+@@ -1825,6 +2312,10 @@
+         else:
+             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
+ 
++        # NHD adaptk: a context row's next block is a zero placeholder (always rejected): verify one row of it.
++        if _NHD_ADAPTK and self._nhd_vlen is not None and num_contexts > 0:
++            self._nhd_vlen.index_fill_(0, self._batch_to_slot[:num_contexts], 1)
++
+         # Context requests are not drafted by the block worker (zero placeholder
+         # token); fill their draft-prob slot rows with a one-hot placeholder so
+         # they are a legal distribution when they become gen requests next iter.
+@@ -1866,6 +2357,152 @@
+             "next_new_tokens": next_new_tokens,
+         }
+ 
++    # ---------------- NHD adaptk -------------------------------------------------------------------------------------
++    def _nhd_init_adaptk(self, num_slots: int, max_batch: int) -> None:
++        self._nhd_vlen = None
++        self._nhd_ring = None
++        self._nhd_vl_used = None
++        if not (_NHD_ADAPTK or _NHD_ADAPTK_TRACE):
++            return
++        K = self.max_draft_len
++        self._nhd_K = K
++        self._nhd_vlen = torch.full((num_slots,), K, dtype=torch.int32, device="cuda")
++        theta = float(os.environ.get("NHD_ADAPTK_THETA", "0") or 0)
++        self._nhd_theta = torch.full((1,), theta, dtype=torch.float32, device="cuda")
++        self._nhd_theta_host = theta
++        self._nhd_ctl_mtime = None
++        self._nhd_prep_n = 0
++        self._nhd_epoch = torch.zeros(num_slots, dtype=torch.float32, device="cuda")
++        self._nhd_epoch_host = [0] * num_slots
++        if _NHD_ADAPTK_TRACE:
++            self._nhd_bsmax = max_batch
++            self._nhd_ring = torch.full(
++                (_NHD_RING, max_batch, 4 + K), -1.0, dtype=torch.float32, device="cuda"
++            )
++            self._nhd_ctr = torch.zeros(1, dtype=torch.long, device="cuda")
++            self._nhd_flushed = 0
++            self._nhd_last_flush = time.time()
++        logger.info(
++            f"[nhd-adaptk] enabled: policy={'on' if _NHD_ADAPTK else 'off'} trace={_NHD_ADAPTK_TRACE} "
++            f"theta={theta} ctl={_NHD_ADAPTK_CTL or '-'} K={K} slots={num_slots}"
++        )
++
++    def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
++        """NHD adaptk: force-reject drafts past each request's verify length (strict acceptance only)."""
++        if self._nhd_vlen is None:
++            return super().sample_and_accept_draft_tokens(logits, attn_metadata, spec_metadata)
++        batch_size = attn_metadata.num_seqs
++        num_contexts = attn_metadata.num_contexts
++        num_gens = batch_size - num_contexts
++        draft_tokens = self._reshape_draft_tokens_for_accept(spec_metadata, num_gens, logits.device)
++        self._nhd_vl_used = None
++        if num_gens > 0 and draft_tokens.dim() == 2 and draft_tokens.shape[1] > 0:
++            vl = self._nhd_vlen[self._batch_to_slot[num_contexts : num_contexts + num_gens]]
++            self._nhd_vl_used = vl
++            if (
++                _NHD_ADAPTK
++                and not getattr(spec_metadata, "enable_penalty", False)
++                and not self._can_use_rejection_sampling(spec_metadata)
++            ):
++                pos = torch.arange(1, draft_tokens.shape[1] + 1, device=draft_tokens.device)
++                draft_tokens = torch.where(
++                    pos[None, :] > vl[:, None].to(pos.dtype),
++                    torch.full_like(draft_tokens, -1),
++                    draft_tokens,
++                )
++        logits = self._reshape_logits_for_accept(logits, num_contexts, num_gens, spec_metadata)
++        return self._accept_draft_tokens(logits, draft_tokens, num_contexts, batch_size, spec_metadata)
++
++    def _nhd_after_draft(self, gen_logits, num_contexts: int, num_gens: int, num_accepted_tokens) -> None:
++        slots = self._batch_to_slot[num_contexts : num_contexts + num_gens]
++        conf = torch.softmax(gen_logits.float(), dim=-1).amax(dim=-1)  # [G, K]
++        K = conf.shape[1]
++        if self._nhd_ring is not None:
++            G = min(num_gens, self._nhd_bsmax)
++            W = 4 + self._nhd_K
++            vl = self._nhd_vl_used
++            if vl is None or vl.shape[0] != num_gens:
++                vl = torch.full((num_gens,), -1, dtype=torch.int32, device=conf.device)
++            if K < self._nhd_K:
++                conf_p = torch.nn.functional.pad(conf, (0, self._nhd_K - K), value=-1.0)
++            else:
++                conf_p = conf[:, : self._nhd_K]
++            data = torch.cat(
++                [
++                    slots.float()[:, None],
++                    self._nhd_epoch[slots][:, None],
++                    num_accepted_tokens[num_contexts : num_contexts + num_gens].float()[:, None],
++                    vl.float()[:, None],
++                    conf_p,
++                ],
++                dim=1,
++            )
++            row = torch.full((1, self._nhd_bsmax, W), -1.0, dtype=torch.float32, device=conf.device)
++            row[0, :G] = data[:G]
++            self._nhd_ring.index_copy_(0, torch.remainder(self._nhd_ctr, _NHD_RING), row)
++            self._nhd_ctr.add_(1)
++        if _NHD_ADAPTK:
++            surv = torch.cumprod(conf, dim=1)
++            vlen = (surv >= self._nhd_theta).sum(dim=1).clamp_(min=1).to(torch.int32)
++            self._nhd_vlen.index_copy_(0, slots, vlen)
++
++    def _nhd_host_tick(self) -> None:
++        """Host side, once per step from DFlashSpecMetadata.prepare(): theta control file and trace flush."""
++        if self._nhd_vlen is None or torch.cuda.is_current_stream_capturing():
++            return
++        self._nhd_prep_n += 1
++        if _NHD_ADAPTK_CTL and self._nhd_prep_n % 16 == 0:
++            try:
++                mt = os.stat(_NHD_ADAPTK_CTL).st_mtime
++            except OSError:
++                mt = None
++            if mt is not None and mt != self._nhd_ctl_mtime:
++                self._nhd_ctl_mtime = mt
++                try:
++                    theta = float(open(_NHD_ADAPTK_CTL).read().strip() or 0)
++                except (OSError, ValueError):
++                    theta = None
++                if theta is not None and theta != self._nhd_theta_host:
++                    self._nhd_theta.fill_(theta)
++                    self._nhd_theta_host = theta
++                    logger.info(f"[nhd-adaptk] theta -> {theta}")
++        if self._nhd_ring is not None and (
++            self._nhd_prep_n % 64 == 0 or time.time() - self._nhd_last_flush > 5.0
++        ):
++            self._nhd_flush()
++
++    def _nhd_flush(self) -> None:
++        self._nhd_last_flush = time.time()
++        n = int(self._nhd_ctr.item())
++        if n <= self._nhd_flushed:
++            return
++        lo = max(self._nhd_flushed, n - _NHD_RING)
++        idx = torch.arange(lo, n, device=self._nhd_ring.device) % _NHD_RING
++        rows = self._nhd_ring.index_select(0, idx).cpu().tolist()
++        try:
++            with open(_NHD_ADAPTK_OUT, "a") as f:
++                for i, step in zip(range(lo, n), rows):
++                    for b in step:
++                        if b[0] < 0 or int(b[0]) == self._dummy_slot:
++                            continue
++                        f.write(
++                            json.dumps(
++                                {
++                                    "i": i,
++                                    "slot": int(b[0]),
++                                    "ep": int(b[1]),
++                                    "nacc": int(b[2]),
++                                    "vl": int(b[3]),
++                                    "theta": self._nhd_theta_host,
++                                    "conf": [round(x, 4) for x in b[4:]],
++                                }
++                            )
++                            + "\n"
++                        )
++        except OSError as ex:
++            logger.warning(f"[nhd-adaptk] trace flush failed: {ex}")
++        self._nhd_flushed = n
++
+     def _draft_block_width(self, draft_model) -> int:
+         """Block slots the draft forward must compute for K draft tokens.
+ 

@@ -1,0 +1,43 @@
+From 0d802612d64547af8fe6e2cd1c461e27477d5e63 Mon Sep 17 00:00:00 2001
+From: Hyperdrive Project <noreply@hyperdrive-project.invalid>
+Date: Sun, 25 Oct 2026 21:12:08 +0000
+Subject: [PATCH 2/2] vLLM dump: --llm-kwargs passthrough
+
+---
+ .../collect_hidden_states/compute_hidden_states_vllm.py     | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/examples/speculative_decoding/collect_hidden_states/compute_hidden_states_vllm.py b/examples/speculative_decoding/collect_hidden_states/compute_hidden_states_vllm.py
+index 9fc756f..e593c5a 100644
+--- a/examples/speculative_decoding/collect_hidden_states/compute_hidden_states_vllm.py
++++ b/examples/speculative_decoding/collect_hidden_states/compute_hidden_states_vllm.py
+@@ -26,6 +26,7 @@ See https://docs.vllm.ai/en/stable/features/speculative_decoding/extract_hidden_
+ 
+ import argparse
+ import atexit
++import json
+ import os
+ import shutil
+ from pathlib import Path
+@@ -180,6 +181,10 @@ def parse_args() -> argparse.Namespace:
+         "--gpu-memory-utilization", type=float, default=0.9,
+         help="vLLM gpu_memory_utilization (lower it on unified-memory systems such as DGX Spark).",
+     )
++    parser.add_argument(
++        "--llm-kwargs", type=str, default="{}",
++        help="Extra vllm.LLM keyword arguments as JSON (e.g. backend selections a model needs).",
++    )
+     add_answer_only_loss_args(parser)
+ 
+     return parser.parse_args()
+@@ -294,6 +299,7 @@ def main(args: argparse.Namespace) -> None:
+         tensor_parallel_size=tp,
+         max_model_len=args.max_seq_len,
+         gpu_memory_utilization=args.gpu_memory_utilization,
++        **json.loads(args.llm_kwargs),
+         trust_remote_code=args.trust_remote_code,
+         enable_chunked_prefill=False,  # required by extract_hidden_states
+         # With prefix caching on, vLLM serves shared prefixes from cache in block-sized
+-- 
+2.43.0
+

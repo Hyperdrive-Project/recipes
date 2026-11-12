@@ -1,0 +1,44 @@
+# Nemotron Hyperdrive (trt-loop, 2026-11-02): Mamba2 gated RMSNorm writes FP8 straight into the static-FP8 out_proj
+# (NHD_MAMBA_NORM_FP8=1), as rc1's GatedDeltaNet.cache_derived_state already does for its norm; FP8QDQLinearMethod
+# skips its own quantize for float8 inputs. Removes 40 per-tensor quantize kernels per step (~6 ms per 32K prefill step).
+diff -ruN -x __pycache__ a/tensorrt_llm/_torch/modules/mamba/mamba2_mixer.py b/tensorrt_llm/_torch/modules/mamba/mamba2_mixer.py
+--- a/tensorrt_llm/_torch/modules/mamba/mamba2_mixer.py
++++ b/tensorrt_llm/_torch/modules/mamba/mamba2_mixer.py
+@@ -36,7 +36,7 @@
+                                                 is_in_breakable_cuda_graph)
+ from ...speculative import SpecMetadata
+ from ...utils import get_model_extra_attrs, is_torch_compiling
+-from ..linear import Linear, TensorParallelMode
++from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode
+ from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+ from .causal_conv1d_triton import \
+     causal_conv1d_update as causal_conv1d_update_triton
+@@ -50,6 +50,11 @@
+ from .selective_state_update import selective_state_update_mtp_ssm_cache_trtllm
+ from .ssd_combined import mamba_chunk_scan_combined
+ 
++# Nemotron Hyperdrive (trt-loop, 2026-11-02): NHD_MAMBA_NORM_FP8=1 lets the gated RMSNorm write FP8 straight into a
++# static-FP8 out_proj (ModelOpt FP8 / mixed-precision checkpoints), as GatedDeltaNet.cache_derived_state does, instead
++# of writing BF16 that out_proj then quantizes with a separate per-tensor kernel.
++_NHD_MAMBA_NORM_FP8 = os.environ.get("NHD_MAMBA_NORM_FP8", "0") == "1"
++
+ 
+ def _extract_mamba2_extra_attrs(layer_idx: str):
+     extra_attrs = get_model_extra_attrs()
+@@ -398,6 +403,16 @@
+                 self.norm.hidden_size, self.norm.group_size)
+                 and self.norm.nvfp4_scale is None):
+             self._try_attach_nvfp4_scale()
++        if _NHD_MAMBA_NORM_FP8 and not self.norm.is_nvfp4:
++            self.norm.fp8_scale = None
++            if (self.out_proj_lora is None
++                    and isinstance(getattr(self.out_proj, "quant_method", None), FP8QDQLinearMethod)):
++                scale = self.out_proj.quant_method.get_static_input_scale(self.out_proj)
++                # detach(): keep the derived scale out of norm's state_dict (shares out_proj.input_scale storage).
++                self.norm.fp8_scale = scale.detach() if scale is not None else None
++            if self.layer_idx == 0 or self.norm.fp8_scale is None:
++                logger.info(f"NHD: Mamba2 layer {self.layer_idx} gated RMSNorm -> "
++                            f"{'FP8 (fused out_proj input quant)' if self.norm.fp8_scale is not None else 'BF16'}")
+ 
+         # Pre-expand A, D, dt_bias for the decode path.
+         # On first call: register as non-persistent buffers so the addresses are

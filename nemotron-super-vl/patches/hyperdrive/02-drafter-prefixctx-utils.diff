@@ -1,0 +1,44 @@
+--- a/tensorrt_llm/_torch/speculative/utils.py	2026-10-23 02:02:46.055102536 +0000
++++ b/tensorrt_llm/_torch/speculative/utils.py	2026-10-23 02:02:46.059790355 +0000
+@@ -450,6 +450,7 @@
+             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
+             spec_dec_mode=spec_config.spec_dec_mode,
+             max_num_requests=max_num_requests,
++            spec_resource_manager=spec_resource_manager,  # NHD: SA manager when sa_config is set
+             layers_to_capture=target_layer_ids,
+             hidden_size=model_config.hidden_size,
+             max_num_tokens=max_num_tokens,
+@@ -634,12 +635,28 @@
+         )
+     if spec_dec_mode.is_parallel_draft():
+         sa_cfg = getattr(spec_config, 'sa_config', None)
++        sa_manager = None
+         if sa_cfg is not None:
+-            return SuffixAutomatonManager(sa_cfg,
+-                                          max_num_requests,
+-                                          max_seq_len,
+-                                          num_seq_slots=num_seq_slots)
+-        return None
++            sa_manager = SuffixAutomatonManager(sa_cfg,
++                                                max_num_requests,
++                                                max_seq_len,
++                                                num_seq_slots=num_seq_slots)
++        # NHD dflash-prefix-ctx: prefix-keyed drafter context (takes precedence; ctx-carry stays inert)
++        if spec_dec_mode.is_dflash() and os.environ.get(
++                'NHD_DFLASH_PREFIX_CTX', '0') == '1':
++            from .dflash import DFlashPrefixCtxTracker
++            logger.info('DFlash prefix-ctx enabled (NHD_DFLASH_PREFIX_CTX=1)')
++            return DFlashPrefixCtxTracker(max_num_requests,
++                                          sa_manager=sa_manager)
++        # NHD dflash-ctx-carry: opt-in prompt-token tracker so DFlash can carry a retained drafter ctx slot over to
++        # the next request that reuses its prefix (wraps the SA manager when sa_config is also set).
++        if spec_dec_mode.is_dflash() and os.environ.get(
++                'NHD_DFLASH_CTX_CARRY', '0') == '1':
++            from .dflash import DFlashCtxCarryManager
++            logger.info('DFlash ctx-carry enabled (NHD_DFLASH_CTX_CARRY=1)')
++            return DFlashCtxCarryManager(max_num_requests,
++                                         sa_manager=sa_manager)
++        return sa_manager
+     if spec_dec_mode.is_ngram():
+         return NGramPoolManager(spec_config, max_num_requests)
+     if spec_dec_mode.is_sa():

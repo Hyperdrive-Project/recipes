@@ -1,0 +1,32 @@
+From fca72ed1e98452e9f38800ac98fc3479eb37bf9f Mon Sep 17 00:00:00 2001
+From: Hyperdrive Project <noreply@hyperdrive-project.invalid>
+Date: Sun, 25 Oct 2026 15:26:14 +0000
+Subject: [PATCH 5/9] scheduler: keep upstream stepping for one-token requests
+ under --prefill-short-tail
+
+A one-token warm-up completed in its merged tail step and its system-prompt checkpoint was not
+published, so later conversations missed the cache. Requests with max_new_tokens <= 1 now step at
+message boundaries as upstream does. 952 Helios lib tests pass.
+
+---
+ helios/src/scheduler/policy.rs | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/helios/src/scheduler/policy.rs b/helios/src/scheduler/policy.rs
+index 9a052a95..3f7bcf1d 100644
+--- a/helios/src/scheduler/policy.rs
++++ b/helios/src/scheduler/policy.rs
+@@ -308,7 +308,9 @@ impl RequestScheduler {
+         // turn's reply (reasoning) can still restore there.
+         let tail = request.prompt_tokens.min(limit).saturating_sub(start);
+         let short = self.policy.prefill_short_tail_tokens;
+-        let mut end = if short > 0 && tail <= short && tail <= capacity {
++        // A request that finishes with this step (max one new token) keeps upstream stepping so its
++        // optional boundary snapshots are not cancelled by its own completion.
++        let mut end = if short > 0 && tail <= short && tail <= capacity && request.max_new_tokens > 1 {
+             let last = request.message_boundaries.iter().rev()
+                 .find(|&&n| start < n && n < start + tail).copied();
+             match last {
+-- 
+2.43.0
+

@@ -1,0 +1,262 @@
+diff --git a/tensorrt_llm/_torch/modules/mamba/mamba2_metadata.py b/tensorrt_llm/_torch/modules/mamba/mamba2_metadata.py
+index b62bf15..2df7f8e 100644
+--- a/tensorrt_llm/_torch/modules/mamba/mamba2_metadata.py
++++ b/tensorrt_llm/_torch/modules/mamba/mamba2_metadata.py
+@@ -26,6 +26,8 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+     CUDA_GRAPH_DUMMY_REQUEST_ID
+ from tensorrt_llm._utils import prefer_pinned
+ 
++_NHD_SSD_CAKE = __import__('os').environ.get('NHD_SSD_CAKE', '0') == '1'
++
+ REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
+ REPLAY_WORK_CACHE_SLOT = 1
+ REPLAY_WORK_PNAT = 2
+@@ -563,7 +565,8 @@ class Mamba2Metadata:
+             self.use_initial_states = bool(
+                 self.has_initial_states_cpu[:num_contexts].any())
+ 
+-            if self.use_initial_states:
++            # Nemotron Hyperdrive: the CAKE SSD prefill (NHD_SSD_CAKE=1) needs the chunk metadata for every prefill.
++            if self.use_initial_states or _NHD_SSD_CAKE:
+                 _extra = compute_extra_chunks_cpu(attn_metadata.seq_lens,
+                                                   num_contexts, self.chunk_size)
+ 
+diff --git a/tensorrt_llm/_torch/modules/mamba/nhd_cake_ssd.py b/tensorrt_llm/_torch/modules/mamba/nhd_cake_ssd.py
+new file mode 100644
+index 0000000..a655320
+--- /dev/null
++++ b/tensorrt_llm/_torch/modules/mamba/nhd_cake_ssd.py
+@@ -0,0 +1,205 @@
++# Nemotron Hyperdrive (trt-loop, 2026-11-02): Mamba2 SSD prefill on FlashInfer 0.7.2's CAKE-generated kernel
++# (flashinfer/mamba/cake_ssd_combined.py + csrc/cake_mamba_ssd_combined, Apache-2.0, SM100/SM103, chunk 128,
++# headdim 64, dstate 128). Only that module and its CUDA sources are loaded, from a FlashInfer 0.7.2 install at
++# NHD_CAKE_FI_DIR (a `pip install --target` dir, default /root/fi072); the rest of TensorRT-LLM keeps the image's
++# flashinfer and tvm_ffi. One launcher call per layer (preprocess + scan), writes the token-major output in place,
++# reads x/B/C through stride-aware TMA descriptors (no copies of the conv output views), keeps the fp16 SSM state.
++# B300 microbench (cloud/trt-loop/jobs/ssd_ab.py, Super shape, packed varlen): 1.35-1.85x faster than the Triton
++# prefill, max error vs Triton about one bf16 ulp. Enabled by NHD_SSD_CAKE=1 (see ssd_combined.py).
++# Varlen metadata form (NHD_CAKE_FORM): "triple" passes TRT's seq_idx / chunk_indices / chunk_offsets (the 0.7.2 API);
++# "cu" passes cu_seqlens and lets the CAKE preprocess derive the segment tables on the device (FlashInfer main's run()
++# has it); "auto" (default) = cu when run() takes cu_seqlens. On B300, FlashInfer main e74a167 with the triple form
++# gave wrong outputs (final states right) for multi-sequence prefills with initial states (j08).
++import functools
++import importlib.util
++import inspect
++import os
++import sys
++import types
++from pathlib import Path
++
++import torch
++import triton
++import triton.language as tl
++
++from tensorrt_llm.logger import logger
++
++NHD_SSD_CAKE = os.environ.get("NHD_SSD_CAKE", "0") == "1"
++_FORM = os.environ.get("NHD_CAKE_FORM", "auto")
++# D (skip term) handling, NHD_CAKE_D_MODE: "kernel" (default) passes the per-head D to the kernel; "hdim" passes it
++# expanded to [nheads, 64] (the kernel's per-channel D path); "split" runs the kernel without D and adds D*x after
++# with a Triton pass (_dx_add). On B300 this call path gave wrong outputs with a per-head D and initial states (j08b:
++# ~0.29 relative error on every token, final states right, both varlen forms; j08c: right without D), while FlashInfer
++# called standalone was correct (j26b/j26c). Split applies to calls with initial states unless NHD_CAKE_D_FIX_ALL=1.
++_D_MODE = os.environ.get("NHD_CAKE_D_MODE", "split" if os.environ.get("NHD_CAKE_D_SPLIT", "0") == "1" else "kernel")
++_D_FIX_ALL = os.environ.get("NHD_CAKE_D_FIX_ALL", "0") == "1"
++_PKG = "nhd_fi072"
++_disabled_reason = None
++last_program = None  # program name of the most recent CAKE call (diagnostics)
++
++
++@functools.cache
++def _cake_cls():
++    root = Path(os.environ.get("NHD_CAKE_FI_DIR", "/root/fi072")) / "flashinfer"
++    src = root / "mamba" / "cake_ssd_combined.py"
++    if not src.is_file():
++        raise FileNotFoundError(f"{src} not found (pip install --target <dir> --no-deps flashinfer-python==0.7.2.post1)")
++    from tvm_ffi import cpp
++    if "embed_cubin" not in inspect.signature(cpp.load_inline).parameters:
++        raise RuntimeError("tvm_ffi.cpp.load_inline has no embed_cubin (need apache-tvm-ffi>=0.1.11)")
++    env = types.ModuleType(f"{_PKG}.jit.env")
++    env.FLASHINFER_CSRC_DIR = root / "data" / "csrc"
++    env.FLASHINFER_JIT_DIR = Path(os.environ.get("NHD_CAKE_JIT_DIR", str(Path.home() / ".cache" / "nhd_cake_jit")))
++    env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
++    for name in (_PKG, f"{_PKG}.jit", f"{_PKG}.mamba"):
++        if name not in sys.modules:
++            pkg = types.ModuleType(name)
++            pkg.__path__ = []
++            sys.modules[name] = pkg
++    sys.modules[f"{_PKG}.jit.env"] = env
++    sys.modules[f"{_PKG}.jit"].env = env
++    spec = importlib.util.spec_from_file_location(f"{_PKG}.mamba.cake_ssd_combined", src)
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = mod
++    spec.loader.exec_module(mod)
++    logger.info(f"NHD: Mamba2 SSD prefill on the FlashInfer CAKE kernel ({src}, JIT dir {env.FLASHINFER_JIT_DIR})")
++    return mod.CakeSSDCombined
++
++
++@functools.cache
++def _runner(nheads, ngroups, state_dtype, has_init, seq_idx_dtype, has_d=True, d_has_hdim=False):
++    return _cake_cls()(128, nheads, 64, 128, ngroups, io_dtype=torch.bfloat16, state_dtype=state_dtype, has_d=has_d,
++                       d_has_hdim=d_has_hdim, has_initial_states=has_init, has_varlen=True, has_z=False,
++                       seq_idx_dtype=seq_idx_dtype)
++
++
++@functools.cache
++def _use_cu_form():
++    if _FORM in ("cu", "triple"):
++        return _FORM == "cu"
++    return "cu_seqlens" in inspect.signature(_cake_cls().run).parameters
++
++
++@functools.cache
++def _arch_ok(device_index):
++    return torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
++
++
++_d_bf16 = {}
++
++
++def _bf16_d(D):
++    key = (D.data_ptr(), D.dtype, D.shape[0])
++    v = _d_bf16.get(key)
++    if v is None:
++        v = D.detach().to(torch.bfloat16).contiguous()
++        _d_bf16[key] = v
++    return v
++
++
++_d_cache = {}
++
++
++def _d_cached(D, kind):
++    key = (D.data_ptr(), D.dtype, D.shape[0], kind)
++    v = _d_cache.get(key)
++    if v is None:
++        if kind == "hdim":
++            v = D.detach().to(torch.bfloat16)[:, None].expand(D.shape[0], 64).contiguous()
++        else:  # fp32 per-head D for the split add
++            v = D.detach().float().contiguous()
++        _d_cache[key] = v
++    return v
++
++
++@triton.jit
++def _dx_add_kernel(out_ptr, x_ptr, d_ptr, L, so_t, sx_t, P: tl.constexpr, BLOCK_T: tl.constexpr,
++                   BLOCK_C: tl.constexpr):
++    # out[t, c] += D[c // P] * x[t, c] in fp32 (one rounding), c = head * P + p; rows strided, channels contiguous.
++    t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
++    c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
++    m = (t < L)[:, None]
++    d = tl.load(d_ptr + c // P)
++    xv = tl.load(x_ptr + t[:, None] * sx_t + c[None, :], mask=m, other=0.0).to(tl.float32)
++    o_offs = t[:, None] * so_t + c[None, :]
++    ov = tl.load(out_ptr + o_offs, mask=m, other=0.0).to(tl.float32)
++    tl.store(out_ptr + o_offs, (ov + d[None, :] * xv).to(out_ptr.dtype.element_ty), mask=m)
++
++
++def _dx_add(dst, x, D):
++    """dst += D[h] * x for dst, x [1, L, H, P] (dst's and x's (H, P) block contiguous, rows strided)."""
++    _, L, H, P = dst.shape
++    Df = _d_cached(D, "split")
++    if (dst.stride(3) == 1 and dst.stride(2) == P and x.stride(3) == 1 and x.stride(2) == P and (H * P) % 256 == 0
++            and L > 0):
++        _dx_add_kernel[(triton.cdiv(L, 32), H * P // 256)](dst, x, Df, L, dst.stride(1), x.stride(1), P=P,
++                                                           BLOCK_T=32, BLOCK_C=256, num_warps=4)
++    else:
++        dst.addcmul_(x, Df.view(1, 1, -1, 1))
++
++
++def _finish(run, o, out, x, D, mode):
++    global last_program
++    last_program = getattr(run, "last_program_name", None)
++    dst = out if out is not None else o
++    if out is not None and o is not None and o.data_ptr() != out.data_ptr():
++        out.copy_(o)  # the runner wrote a packed copy instead of the caller's buffer
++    if mode == "split":
++        _dx_add(dst, x, D)
++
++
++def cake_supported(x, B, chunk_size, z, cu_seqlens, D, out):
++    """Shapes the CAKE kernel admits on this GPU (packed varlen, batch 1, no z, per-head D, token-major out)."""
++    global _disabled_reason
++    if _disabled_reason is not None:
++        return False
++    if not (z is None and cu_seqlens is not None and x.shape[0] == 1 and chunk_size == 128 and x.shape[-1] == 64
++            and B.shape[-1] == 128 and D is not None and D.dim() == 1 and x.dtype == torch.bfloat16
++            and B.dtype == torch.bfloat16 and (out is None or out.is_contiguous())):
++        return False
++    if not _arch_ok(x.device.index):
++        return False
++    try:
++        _cake_cls()
++    except Exception as e:  # never take the server down: log once, keep the Triton path
++        _disabled_reason = f"{type(e).__name__}: {e}"
++        logger.warning(f"NHD: CAKE SSD prefill disabled, using Triton ({_disabled_reason})")
++        return False
++    return True
++
++
++def cake_varlen_fwd(x, dt, A, B, C, D, dt_bias, initial_states, seq_idx, chunk_indices, chunk_offsets, cu_seqlens,
++                    dt_softplus, dt_limit, out, state_dtype):
++    """Packed-varlen Mamba2 SSD forward; returns the per-sequence final states (= Triton's varlen_states)."""
++    sd = state_dtype if state_dtype is not None else (
++        initial_states.dtype if initial_states is not None else torch.bfloat16)
++    if initial_states is not None and initial_states.dtype != sd:
++        initial_states = initial_states.to(sd)
++    num_seqs = cu_seqlens.shape[0] - 1
++    if A.dtype != torch.float32:
++        A = A.float()
++    mode = _D_MODE if (D is not None and (initial_states is not None or _D_FIX_ALL)) else "kernel"
++    d_arg = None if (mode == "split" or D is None) else _d_cached(D, "hdim") if mode == "hdim" else _bf16_d(D)
++    rkey = dict(has_d=mode != "split", d_has_hdim=mode == "hdim")
++    if _use_cu_form():
++        # The preprocess derives the 128-token segment tables from cu_seqlens on the device (no TRT chunk metadata).
++        run = _runner(x.shape[2], B.shape[2], sd, initial_states is not None, torch.int32, **rkey)
++        cu = cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
++        o, fs = run.run(x, dt, A, B, C, D=d_arg, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
++                        initial_states=initial_states, out=out, return_final_states=True, cu_seqlens=cu.contiguous())
++        _finish(run, o, out, x, D, mode)
++        return fs
++    if chunk_indices is None or chunk_offsets is None:
++        # Normally precomputed once per step by Mamba2Metadata.prepare (no host sync); this path syncs.
++        from .mamba2_metadata import cu_seqlens_to_chunk_indices_offsets_triton
++        chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets_triton(cu_seqlens, 128,
++                                                                                  total_seqlens=x.shape[1])
++    if seq_idx.dtype not in (torch.int32, torch.int64):
++        seq_idx = seq_idx.to(torch.int32)
++    run = _runner(x.shape[2], B.shape[2], sd, initial_states is not None, seq_idx.dtype, **rkey)
++    o, fs = run.run(x, dt, A, B, C, D=d_arg, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit,
++                    initial_states=initial_states, seq_idx=seq_idx, chunk_indices=chunk_indices,
++                    chunk_offsets=chunk_offsets, out=out, return_final_states=True,
++                    num_seqs=None if initial_states is not None else num_seqs)
++    _finish(run, o, out, x, D, mode)
++    return fs
+diff --git a/tensorrt_llm/_torch/modules/mamba/ssd_combined.py b/tensorrt_llm/_torch/modules/mamba/ssd_combined.py
+index a9fb7ff..ac255a6 100644
+--- a/tensorrt_llm/_torch/modules/mamba/ssd_combined.py
++++ b/tensorrt_llm/_torch/modules/mamba/ssd_combined.py
+@@ -30,6 +30,7 @@ from tensorrt_llm.math_utils import pad_up
+ 
+ from .fuse_elementwise_ops import ssd_output_transpose
+ from .mamba2_metadata import cu_seqlens_to_chunk_indices_offsets_triton
++from .nhd_cake_ssd import NHD_SSD_CAKE, cake_supported, cake_varlen_fwd
+ from .ssd_bmm import _bmm_chunk_fwd
+ from .ssd_chunk_scan import _chunk_scan_fwd
+ from .ssd_chunk_state import (_chunk_cumsum_fwd, _chunk_state_fwd,
+@@ -503,6 +504,15 @@ def mamba_chunk_scan_combined(
+         assert (cu_seqlens is not None
+                 ), "cu_seqlens must be provided if return_varlen_states is True"
+ 
++    # Nemotron Hyperdrive: FlashInfer CAKE SSD prefill (nhd_cake_ssd.py) for the packed-varlen prefill call.
++    if NHD_SSD_CAKE:
++        if not return_final_states and cake_supported(x, B, chunk_size, z, cu_seqlens, D, out):
++            return cake_varlen_fwd(x, dt, A, B, C, D, dt_bias, initial_states, seq_idx, chunk_indices, chunk_offsets,
++                                   cu_seqlens, dt_softplus, dt_limit, out, state_dtype)
++        if initial_states is None:
++            # Mamba2Metadata precomputes the chunk metadata for CAKE; stock Triton expects None without initial states.
++            chunk_indices = chunk_offsets = None
++
+     # FlashInfer fused CUTLASS kernel on Blackwell (SM100+); both varlen and
+     # non-varlen route here based on cu_seqlens. Falls back to Triton when the
+     # MMA tile constraints on (chunk_size, dstate, headdim) aren't met.

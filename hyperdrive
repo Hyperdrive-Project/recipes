@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+# Part of Hyperdrive recipes, https://github.com/Hyperdrive-Project/recipes
+# Apache-2.0. If this helps you, a credit to Hyperdrive recipes is appreciated.
+"""Pick and run a Hyperdrive recipe. Standard library only; reads recipes.json.
+
+  ./hyperdrive list [--gpu b200|b300|spark] [--json]   all recipes, or the ones for a GPU
+  ./hyperdrive detect [--json]                          which GPU this machine has and the recipes for it
+  ./hyperdrive show <id> [--json]                       setup, serve, stop and check commands for one recipe
+  ./hyperdrive run <id> [--yes] [--skip-setup]          print the plan; with --yes, run setup + serve
+  ./hyperdrive check [--base-url http://127.0.0.1:8000]  the quality gate against a running server (no /v1)
+
+Every command prints a plan first. Nothing downloads or starts without --yes.
+"""
+import argparse, json, os, shutil, subprocess, sys
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+GPU_NAMES = {"b300": ["B300"], "b200": ["B200"], "spark": ["GB10", "DGX Spark"]}
+
+
+def catalog():
+    with open(os.path.join(ROOT, "recipes.json")) as f:
+        return json.load(f)
+
+
+def detect_gpu():
+    if not shutil.which("nvidia-smi"):
+        return None, None
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=20).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    name = out.splitlines()[0] if out else ""
+    for key, needles in GPU_NAMES.items():
+        if any(n.lower() in name.lower() for n in needles):
+            return key, name
+    return None, name or None
+
+
+def find(cat, rid):
+    for r in cat["recipes"]:
+        if r["id"] == rid:
+            return r
+    sys.exit(f"unknown recipe '{rid}'. Try: ./hyperdrive list")
+
+
+def table(rows):
+    for r in rows:
+        print(f"{r['id']:<24} {'/'.join(r['gpu']):<10} {r['engine'][:44]:<44} {r['result']}")
+
+
+def cmd_list(a):
+    cat = catalog()
+    rows = [r for r in cat["recipes"] if not a.gpu or a.gpu in r["gpu"]]
+    if a.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        table(rows)
+
+
+def cmd_detect(a):
+    key, name = detect_gpu()
+    rows = [r for r in catalog()["recipes"] if key in r["gpu"]] if key else []
+    if a.json:
+        print(json.dumps({"gpu": key, "gpu_name": name, "recipes": [r["id"] for r in rows]}, indent=2))
+        return
+    if not name:
+        print("No NVIDIA GPU found (nvidia-smi missing or failed). Recipes target B300, B200 and DGX Spark.")
+    elif not key:
+        print(f"Found '{name}'. No recipe targets this GPU yet; recipes target B300, B200 and DGX Spark.")
+    else:
+        print(f"Found '{name}' -> {key}. Recipes for it:")
+        table(rows)
+
+
+def cmd_show(a):
+    r = find(catalog(), a.id)
+    if a.json:
+        print(json.dumps(r, indent=2))
+        return
+    print(f"{r['id']}: {r['model']} on {'/'.join(r['gpu'])}, {r['engine']}")
+    print(f"  use for: {r['use_for']}\n  result:  {r['result']}\n  quality: {r['quality']}")
+    if r.get("weight_change"):
+        print(f"  weights: {r['weight_change']}")
+    print(f"  model:   {r['hf']}\n  docs:    {r['docs']}\n\nsetup (once):")
+    for s in r["setup"] or ["(none)"]:
+        print(f"  {s}")
+    print(f"serve:\n  {r['serve']}\nstop:\n  {r['stop']}")
+    print(f"endpoint: {r['endpoint']}  model name: {r['served_model']}")
+    if r.get("request_note"):
+        print(f"requests: {r['request_note']}")
+    print(f"check:\n  {catalog()['checks']['quality']}")
+
+
+def cmd_run(a):
+    r = find(catalog(), a.id)
+    steps = ([] if a.skip_setup else r["setup"]) + [r["serve"]]
+    manual = [s for s in steps if s.startswith("see ") or "<" in s or "Ctrl-C" in s]
+    print(f"Plan for {r['id']} (from {ROOT}):")
+    for i, s in enumerate(steps, 1):
+        print(f"  {i}. {s}")
+    if manual:
+        print("\nThis recipe has manual steps; follow", r["docs"])
+        return
+    key, name = detect_gpu()
+    if key not in r["gpu"]:
+        print(f"\nwarning: this recipe targets {'/'.join(r['gpu'])}; detected {name or 'no GPU'}.")
+    if not a.yes:
+        print("\nThis downloads weights and holds the GPU. Re-run with --yes to execute.")
+        return
+    for s in steps:
+        print(f"\n$ {s}", flush=True)
+        rc = subprocess.run(["bash", "-c", s], cwd=ROOT).returncode
+        if rc:
+            sys.exit(f"step failed ({rc}): {s}")
+    print(f"\nserving at {r['endpoint']} as '{r['served_model']}'. Next: ./hyperdrive check")
+
+
+def cmd_check(a):
+    cmd = [sys.executable, os.path.join(ROOT, "correctness", "eval.py"), "--label", "hyperdrive-check",
+           "--tasks", "math,code,tools", "--reasoning", "on"]
+    if a.base_url:
+        cmd += ["--base-url", a.base_url]
+    print("$ " + " ".join(cmd), flush=True)
+    sys.exit(subprocess.run(cmd).returncode)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="hyperdrive", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("list"); s.add_argument("--gpu", choices=list(GPU_NAMES)); s.add_argument("--json", action="store_true"); s.set_defaults(f=cmd_list)
+    s = sub.add_parser("detect"); s.add_argument("--json", action="store_true"); s.set_defaults(f=cmd_detect)
+    s = sub.add_parser("show"); s.add_argument("id"); s.add_argument("--json", action="store_true"); s.set_defaults(f=cmd_show)
+    s = sub.add_parser("run"); s.add_argument("id"); s.add_argument("--yes", action="store_true")
+    s.add_argument("--skip-setup", action="store_true"); s.set_defaults(f=cmd_run)
+    s = sub.add_parser("check"); s.add_argument("--base-url"); s.set_defaults(f=cmd_check)
+    a = p.parse_args()
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()
